@@ -3,41 +3,31 @@ ship.py - Player ship for Scramble.
 
 Original Z80 sources
 --------------------
-fn_init_game_state ($6390):
-    ship_screen_col ($6AB6) = 0
-    ship_screen_row ($6AB7) = 5
-    ship_pixel_x    ($6AC1) = $67 = 103  (horizontal pixel position)
-    ship_pixel_y    ($6AC2) = 0
+fn_init_game_state ($638F/$6390):
+    ship_x ($6AAE) = $14 = 20   (horizontal pixel coordinate)
+    ship_y ($6AAF) = $14 = 20   (vertical pixel coordinate)
+    These are written by LD A,$00/$05/$67 stores; the true entry is at
+    $638F where the tail byte $3E of the *LAST* hi-score string acts as
+    the opcode for LD A,$00.
+
+fn_update_ship_pos ($6926):
+    Reads TRS-80 joystick matrix at $3800 and updates ship_x / ship_y.
+    NO GRAVITY.  Ship holds its current position when no direction key
+    is being held.  Movement per update tick (every 5th frame):
+        UP key   ($3840 bit 6): B += 2 → ship_x += 2 (move right/forward)
+        DOWN key ($3840 bit 5): B -= 2 → ship_x -= 2 (move left/backward)
+        RIGHT key ($3840 bit 3): C -= 1 → ship_y -= 1 (move up)
+        LEFT key  ($3840 bit 4): C += 1 → ship_y += 1 (move down)
+    Clamps: X stops at $7A (122); Y stops at $2D (45).
+
+fn_redraw_ship ($69A4):
+    Blits the ship sprite to VRAM using pixel-bitmask technique (fn_update_
+    cannon_shot style OR-into-cell).  Detects collision via AND between the
+    sprite bitmask and existing VRAM content; sets collision_flag ($6678).
 
 fn_draw_ship ($65A3):
-    Copies 6 chars from buf at $66A8 to video RAM at $3C39.
-    The loop: LD A,(HL) / CP $20 / JR Z,skip / LD (DE),A
-    i.e. space chars ($20) are transparent - not written to screen.
-    This is the "masked sprite" technique.
-
-fn_erase_ship ($65AE):
-    Writes $20 (space) to 6 consecutive video RAM addresses.
-
-fn_move_ship ($65BF):
-    Loads ship_pixel_y, applies UP/DOWN input, gravity.
-
-fn_check_ship_crash ($65C2):
-    Checks 6 video RAM cells at ship position for non-space chars.
-
-The ship is fixed at a horizontal pixel position of ~16 (left side of
-screen).  Vertical position is controlled by the player: UP key applies
-upward thrust, gravity pulls the ship down each frame.
-
-Ship sprite
------------
-The ship sprite is 6 character cells wide × 2 rows tall.  In the original
-the sprite data is loaded from the screen layout buffer at $66A8.  We
-approximate the original sprite shape using TRS-80 semigraphic characters:
-
-  Top row:    [blank, top-right-corner, right-block, full-block, partial, blank]
-  Bottom row: [blank, bottom-right, right-block, full-block, partial, blank]
-
-The rightmost part is the cockpit/nose; the left part is the engine exhaust.
+    Copies B bytes from sprite buffer (HL) to VRAM (DE) with per-byte
+    transparency: bytes equal to $20 (ASCII space) are skipped.
 """
 
 from dataclasses import dataclass
@@ -45,8 +35,8 @@ from dataclasses import dataclass
 from constants import (
     PIXELS_WIDE, PIXELS_TALL,
     SHIP_INIT_PIXEL_X, SHIP_INIT_PIXEL_Y,
-    SHIP_PIXEL_X_FIXED,
-    SHIP_GRAVITY_PX, SHIP_THRUST_PX,
+    SHIP_X_MAX, SHIP_Y_MAX,
+    SHIP_SPEED_X, SHIP_SPEED_Y,
     SHIP_SPRITE_CHARS, SHIP_WIDTH_CHARS, SHIP_HEIGHT_CHARS,
 )
 from trs80_screen import TRS80Screen
@@ -121,24 +111,22 @@ class Ship:
     """
     Represents the player's ship.
 
-    Position is tracked in *logical pixels* (0–127 horizontal, 0–47 vertical).
-    The ship is drawn as a 6×2 character-cell sprite, with each char cell
-    covering 2×3 logical pixels.
+    Position is tracked in *logical pixels* matching the TRS-80 semigraphic
+    coordinate space used by fn_compute_vram_offset ($6EE0):
+        X (horizontal): 0–121  ($6AAE ship_x)
+        Y (vertical):   0–44   ($6AAF ship_y)
 
-    Mirrors the state tracked by the Z80 game at:
-        $6AB6 (ship_screen_col), $6AB7 (ship_screen_row)
-        $6AC1 (ship_pixel_x),    $6AC2 (ship_pixel_y)
+    The ship has NO gravity.  It holds its current position until the player
+    presses a direction key.  This matches fn_update_ship_pos ($6926) which
+    only updates position when a key is held.
     """
 
-    # Pixel-space position of the top-left corner of the sprite
+    # Pixel-space position
     pixel_x: float = float(SHIP_INIT_PIXEL_X)
     pixel_y: float = float(SHIP_INIT_PIXEL_Y)
 
     # Previous pixel_y - used for erase/redraw
     prev_pixel_y: float = float(SHIP_INIT_PIXEL_Y)
-
-    # Vertical velocity in pixels/frame (positive = downward)
-    velocity_y: float = 0.0
 
     # State flags
     alive: bool = True
@@ -147,12 +135,12 @@ class Ship:
     def reset(self) -> None:
         """
         Reset ship to initial state.
-        Mirrors fn_init_game_state ($6390).
+        Mirrors fn_init_game_state ($638F/$6390) which sets:
+            ship_x ($6AAE) <- 20, ship_y ($6AAF) <- 20.
         """
         self.pixel_x = float(SHIP_INIT_PIXEL_X)
         self.pixel_y = float(SHIP_INIT_PIXEL_Y)
         self.prev_pixel_y = float(SHIP_INIT_PIXEL_Y)
-        self.velocity_y = 0.0
         self.alive = True
         self.invulnerable_frames = 0
 
@@ -160,40 +148,56 @@ class Ship:
     # Movement
     # ------------------------------------------------------------------
 
-    def update(self, thrust_up: bool, thrust_down: bool) -> None:
+    def update(
+        self,
+        move_up: bool = False,
+        move_down: bool = False,
+        move_right: bool = False,
+        move_left: bool = False,
+    ) -> None:
         """
-        Apply gravity and player input to update vertical position.
-        Mirrors fn_move_ship ($65BF).
+        Apply player directional input to update position.
+        Mirrors fn_update_ship_pos ($6926).
 
-        The original game:
-        - Gravity pulls the ship down SHIP_GRAVITY_PX pixels/frame
-        - Pressing UP applies SHIP_THRUST_PX upward force
-        - Pressing DOWN (not in classic Scramble - the ship can only go up
-          or drift down naturally)  -- some versions allow down.
-        - Horizontal position is FIXED (Scramble has no horizontal control)
+        No gravity.  The ship holds its current position until a key is
+        pressed.  Per fn_update_ship_pos:
+            UP/DOWN keys:   ship_x ±2 (horizontal, forward/backward)
+            LEFT/RIGHT keys: ship_y ±1 (vertical, up/down in the cave)
+
+        In Python's horizontal-scroller interpretation:
+            RIGHT arrow → ship_x += SHIP_SPEED_X (fly forward)
+            LEFT arrow  → ship_x -= SHIP_SPEED_X (pull back)
+            UP arrow    → ship_y -= SHIP_SPEED_Y (rise toward ceiling)
+            DOWN arrow  → ship_y += SHIP_SPEED_Y (dive toward floor)
+
+        Bounds from fn_update_ship_pos $6963/$6972:
+            X: skip store if X would reach $7A (122) or wrap via $FE
+            Y: skip store if Y >= $2D (45)
         """
         self.prev_pixel_y = self.pixel_y
 
         if self.invulnerable_frames > 0:
             self.invulnerable_frames -= 1
 
-        # Apply thrust or gravity to velocity
-        if thrust_up:
-            # Thrust up: overcome gravity + climb
-            self.velocity_y -= SHIP_THRUST_PX
-        else:
-            # Gravity
-            self.velocity_y += SHIP_GRAVITY_PX
+        # Horizontal movement (maps to UP/DOWN keys in Z80)
+        if move_right:
+            new_x = self.pixel_x + SHIP_SPEED_X
+            if new_x < SHIP_X_MAX:
+                self.pixel_x = new_x
+        if move_left:
+            new_x = self.pixel_x - SHIP_SPEED_X
+            if new_x >= 0:
+                self.pixel_x = new_x
 
-        # Clamp velocity to sane range
-        self.velocity_y = max(-6.0, min(4.0, self.velocity_y))
-
-        # Apply velocity
-        self.pixel_y += self.velocity_y
-
-        # Clamp to screen bounds (can't fly above top or below bottom)
-        # Leave 6 px buffer at top (ceiling), 6 px at bottom (floor HUD row)
-        self.pixel_y = max(0.0, min(PIXELS_TALL - 6.0, self.pixel_y))
+        # Vertical movement (maps to RIGHT/LEFT keys in Z80)
+        if move_up:
+            new_y = self.pixel_y - SHIP_SPEED_Y
+            if new_y >= 0:
+                self.pixel_y = new_y
+        if move_down:
+            new_y = self.pixel_y + SHIP_SPEED_Y
+            if new_y <= SHIP_Y_MAX:
+                self.pixel_y = new_y
 
     # ------------------------------------------------------------------
     # Screen drawing
@@ -239,15 +243,14 @@ class Ship:
     def check_terrain_collision(self, screen: TRS80Screen) -> bool:
         """
         Check whether the ship has collided with terrain or an enemy.
-        Mirrors fn_check_ship_crash ($65C2).
+        Mirrors the pixel-bitmask collision in fn_redraw_ship ($69A4): the
+        sprite mask bytes are AND-ed against existing VRAM content; if any
+        overlap exists fn_set_collision_flag ($69D6) fires and sets
+        collision_flag $6678.  fn_check_ship_crash ($65CA) then processes
+        that event (awards score, triggers scroll effect).
 
-        The Z80 code reads the video RAM character at each of the 6 cells
-        occupied by the ship.  If any cell contains a non-blank char that
-        was NOT written by the ship itself (i.e. was already there before
-        fn_draw_ship ran), the ship has crashed.
-
-        We implement this by checking the cells BEFORE drawing the ship,
-        looking for any non-blank content.
+        We approximate this at char-cell granularity: any non-blank cell
+        at a position the ship occupies counts as a collision.
         """
         if not self.alive or self.invulnerable_frames > 0:
             return False
@@ -269,7 +272,7 @@ class Ship:
 
     def check_screen_boundary(self) -> bool:
         """Return True if ship is touching the top or bottom screen edge."""
-        return self.pixel_y <= 0 or self.pixel_y >= PIXELS_TALL - 6
+        return self.pixel_y <= 0 or self.pixel_y >= SHIP_Y_MAX
 
     # ------------------------------------------------------------------
     # Properties

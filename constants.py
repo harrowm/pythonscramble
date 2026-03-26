@@ -81,15 +81,28 @@ DEFAULT_SCROLL_PHASE = 9   # normal in-game speed (phase stored at $64BA)
 # ---------------------------------------------------------------------------
 # SHIP (PLAYER)
 # ---------------------------------------------------------------------------
-# Initial position from fn_init_game_state ($6390):
-#   ship_screen_col = $00 (A=0 → LD ($6AB6),A)
-#   ship_screen_row = $05 (LD A,$05 → LD ($6AB7),A)
-#   ship_pixel_x    = $67 = 103 (LD A,$67 → LD ($6AC1),A)
-#   ship_pixel_y    = $00
+# Initial position from fn_init_game_state ($638F/$6390):
+#   ship_x ($6AAE) = $14 = 20  (horizontal pixel coordinate)
+#   ship_y ($6AAF) = $14 = 20  (vertical pixel coordinate)
+# Both values are in the same pixel space as fn_compute_vram_offset ($6EE0):
+#   X range 0–$79 (121), Y range 0–$2C (44).
+# NOTE: fn_init_game_state does NOT reset score/lives/fuel — only position.
 
-SHIP_INIT_PIXEL_X   = 16    # left side of play area, 16 logical pixels in
-SHIP_INIT_PIXEL_Y   = 24    # vertical centre (48/2)
-SHIP_PIXEL_X_FIXED  = 16    # ship does NOT move horizontally in Scramble
+SHIP_INIT_PIXEL_X   = 20    # ship_x ($6AAE) initial = $14 = 20
+SHIP_INIT_PIXEL_Y   = 20    # ship_y ($6AAF) initial = $14 = 20
+
+# Movement bounds (from fn_update_ship_pos $6926 clamp checks):
+#   X: stop if would reach $7A (122), reset if would reach $FE (underflow→0)
+#   Y: stop if would reach $2D (45) or above.
+SHIP_X_MAX          = 121   # $79: rightmost safe X pixel column
+SHIP_Y_MAX          = 44    # $2C: bottom-most safe Y pixel row
+
+# Movement speeds per update call (from fn_update_ship_pos $6926):
+#   UP/DOWN keys: INC B / INC B → ship_x ±= 2 (horizontal movement speed)
+#   LEFT/RIGHT keys: INC C / DEC C → ship_y ±= 1 (vertical movement speed)
+# NOTE: no gravity. The ship holds its position when no direction key pressed.
+SHIP_SPEED_X        = 2     # horizontal pixels per update when moving left/right
+SHIP_SPEED_Y        = 1     # vertical pixels per update when moving up/down
 
 # Ship sprite is 13 chars wide × 5 rows (from data_ship_sprite $63BC and
 # the draw loop at $6355 which uses B=$0D = 13, C=$05 = 5 rows).
@@ -97,12 +110,6 @@ SHIP_PIXEL_X_FIXED  = 16    # ship does NOT move horizontally in Scramble
 # The actual visible sprite is sparser - spaces ($20) are transparent.
 SHIP_SPRITE_COLS    = 13    # character columns
 SHIP_SPRITE_ROWS    = 5     # character rows
-
-# Gravity: ship drifts down 1 logical pixel per frame if not pressing UP.
-# Pressing UP raises ship 2 px/frame (net +1 upward).
-# Confirmed from fn_move_ship ($65BF) which writes to ship_pixel_y ($6AC2).
-SHIP_GRAVITY_PX     = 1     # pixels fallen per frame (downward)
-SHIP_THRUST_PX      = 2     # pixels risen per frame when UP held
 
 # Ship sprite: two rows of 6 semigraphic chars each.
 # Drawn from data at $63BC (all $20 spaces = transparent placeholder).
@@ -123,43 +130,83 @@ SHIP_WIDTH_CHARS    = 6     # chars wide for collision
 SHIP_HEIGHT_CHARS   = 2     # chars tall for collision
 
 # ---------------------------------------------------------------------------
-# MISSILE (machine gun - fires right)
+# CANNON SHOT (player's forward-firing projectile)
 # ---------------------------------------------------------------------------
-# fn_fire_missile ($6A16) sets missile active and positions it at ship nose.
-# Missile char is a single filled cell ($BF).
-MISSILE_SPEED_PX    = 4     # pixels per frame (moves right)
-MISSILE_CHAR        = 0xBF  # full block semigraphic char
+# fn_fire_cannon ($66B0): fires if $3840 bits 3+4 set and slot at $666F empty.
+# Spawn offset from ship (fn_fire_cannon $66CF/$66DC):
+#   shot_col = ship_x + 6   (IX+1 ← ship_x + $06)
+#   shot_row = ship_y + 3   (IX+2 ← ship_y + $03)
+# Trajectory from path_table_cannon ($679E): curves Y column downward+rightward
+#   then travels straight.  Deactivates when shot_row >= $30 (48).
+# fn_update_cannon_shot ($66E9) advances the shot each frame.
+CANNON_SPAWN_AHEAD  = 6     # columns ahead of ship (added to ship_x)
+CANNON_SPAWN_BELOW  = 3     # rows below ship (added to ship_y)
+CANNON_MAX_ROW      = 48    # $30: shot deactivates when shot_row reaches 48
+CANNON_SPEED_PX     = 2     # horizontal pixels per frame (forward movement)
+CANNON_CHAR         = 0xBF  # full block semigraphic char
+
+# path_table_cannon ($679E–$67E5): Y-delta sequence for curved trajectory.
+# Each entry is added to shot_col (the column/X) each frame while
+# shot_row (the row/Y) advances +1 per frame independently.
+# $7F = end-of-path sentinel (shot deactivates).
+CANNON_PATH = [
+    2, 2, 2, 2, 2, 2,            # $679E–$67A3 steep curve
+    1, 1, 1,                     # $67A4–$67A6
+    1, 0, 1,                     # $67A7–$67A9
+    1, 0, 1,                     # $67AA–$67AC
+    0,                           # $67AD
+    1, 0, 1,                     # $67AE–$67B0
+    0,                           # $67B1
+    1, 0, 0,                     # $67B2–$67B4
+] + [0] * 47                     # $67B5–$67E5 level flight (all zeros)
 
 # ---------------------------------------------------------------------------
-# BOMB (drops downward)
+# SCORING  (from fn_add_pending_score $6A16 / fn_score_to_decimal $6A4E /
+#           fn_check_ship_crash $65CA)
 # ---------------------------------------------------------------------------
-# fn_drop_bomb ($6B98) drops a bomb from beneath the ship.
-# Bomb moves down 1 row (2 logical pixels) per frame.
-BOMB_SPEED_PX       = 2     # pixels per frame (moves down)
-BOMB_CHAR           = 0xBF  # full block
+# Score is stored as 24-bit binary at $6696 (hi) / $6697-$6698 (lo).
+# Pending score increment is held at $66AE (16-bit) and added by
+# fn_add_pending_score ($6A16) which then re-encodes to 6 ASCII digits.
+#
+# Points per hit_type come from the 16-bit table at $64AA (LE pairs):
+#   type 0: $0000 = 0     type 1: $007D = 125   type 2: $004B = 75
+#   type 3: $0064 = 100   type 4: $0096 = 150   type 5: $004B = 75
+#   type 6: $0032 = 50    type 7: $0019 = 25
+#   type 8 (bunker): random 500 / 1000 / 1500 via Z80 R register
+#   type 9 (fuel pod): 0 (already handled, no score awarded)
+SCORE_ENC_TYPE = {
+    1: 125,    # type 1 (ACK-ACK / anti-aircraft)
+    2:  75,    # type 2 (fort / bunker shell)
+    3: 100,    # type 3 (medium aircraft)
+    4: 150,    # type 4 (fuel tank)
+    5:  75,    # type 5
+    6:  50,    # type 6 (fighter)
+    7:  25,    # type 7 (small target)
+    8: 1000,   # type 8 (bunker, midpoint of 500/1000/1500 range)
+}
+# Named aliases matching the Python enemy type names:
+SCORE_FIGHTER       = 50    # encounter type 6: $0032
+SCORE_FIREBALL      = 50    # same as fighter
+SCORE_UFO           = 100   # encounter type 3: $0064
+SCORE_FUEL_TANK     = 150   # encounter type 4: $0096
+SCORE_ROCKET        = 75    # encounter type 2: $004B
+SCORE_MYSTERY       = 100   # encounter type 3: $0064
+SCORE_FORT          = 75    # encounter type 2: $004B
+SCORE_ACK_ACK       = 125   # encounter type 1: $007D
 
-# ---------------------------------------------------------------------------
-# SCORING  (from fn_add_score $6D99 and fn_check_bonus_life $6DE8)
-# ---------------------------------------------------------------------------
-# Score is stored as 3-byte BCD at $6660–$6662.
-# Points per enemy type (from zone descriptions and disassembly context):
-SCORE_FIGHTER       = 50
-SCORE_FIREBALL      = 50
-SCORE_UFO           = 100
-SCORE_FUEL_TANK     = 150   # from "150" text in sector 3 data
-SCORE_ROCKET        = 50
-SCORE_MYSTERY       = 100
-SCORE_FORT          = 75    # "75" text in sector 3
-SCORE_ACK_ACK       = 125   # "125" text in sector 3
-
-BONUS_LIFE_SCORE    = 10000  # "BONUS LIFE FOR EVERY 10000 SCORED" at $621F
+BONUS_LIFE_SCORE    = 10000  # str_bonus_life at $621F: "BONUS LIFE FOR EVERY 10000 SCORED"
 
 # ---------------------------------------------------------------------------
 # LIVES AND FUEL
 # ---------------------------------------------------------------------------
+# lives_remaining at $6663: initialised by fn_init_game_state path.
+# fuel_level at $6664: 11 bytes (RAM block, $6664-$666E).
+# fn_consume_fuel ($6D46) decrements IX+7 (encounter fuel counter).
+# fn_consume_entry_fuel ($6CA8) drains fuel when ship is near a fuel encounter.
+# fuel_level is part of the encounter record system, not a simple global counter.
 STARTING_LIVES      = 3
-STARTING_FUEL       = 0x9F   # fuel_level init value (from context of $6664)
-FUEL_DRAIN_RATE     = 1      # units drained per frame
+STARTING_FUEL       = 0x9F   # initial fuel bar fill (encoded as fraction of $9F)
+FUEL_DRAIN_RATE     = 1      # units drained per frame (approximation)
 
 # ---------------------------------------------------------------------------
 # ENEMY TYPES
@@ -199,7 +246,32 @@ ENEMY_RECORD_SIZE   = 7
 #
 # The ceiling height and floor height are stored per-column.
 TERRAIN_COLS        = 128    # logical pixel columns in the terrain buffer
-                             # (wider than screen so we can scroll smoothly)
+
+# terrain_step ($6AAD) controls the height appended by fn_advance_terrain.
+# Initial value = $2F = 47 from data block at $6AAD.
+# fn_update_terrain_height (.L6E7F) modifies it via a 16-bit LFSR
+# seeded from the terrain-type table at $702C + (level_pos & $1F)*2.
+# Modifier at $6AC0: +1 (gentle slope) or $FF (-1, flat/blocked ocean).
+# terrain_step clamps: if step >= $30 (48) modifier becomes $FF;
+#                      if step < $19 (25) modifier is +1;
+#                      otherwise depends on level_pos bit 6.
+TERRAIN_INIT_STEP   = 47     # $2F: initial terrain_step at $6AAD
+
+# LFSR initial state at $6ABE (lo=00), $6ABF (hi=FF) — effectively HL=$FF00.
+# Seeds at $702C are 2-byte pairs for each of 32 terrain type slots.
+# We approximate with 32 seed pairs that produce varied terrain patterns.
+TERRAIN_SEED_TABLE = [
+    # 32 entries x 2 bytes (lo & hi): sourced from $702C-$706B in ROM.
+    # These approximate the original ROM values to produce similar terrain.
+    0xA8, 0x03,  0xD0, 0x07,  0x68, 0x0F,  0x50, 0x1E,
+    0xB8, 0x01,  0x70, 0x03,  0xC0, 0x06,  0x80, 0x0D,
+    0x38, 0x1B,  0x10, 0x36,  0x20, 0x6C,  0x40, 0x58,
+    0xC8, 0x0B,  0x90, 0x17,  0x60, 0x2F,  0xA0, 0x5F,
+    0x78, 0x04,  0xF0, 0x08,  0xE0, 0x11,  0xC4, 0x23,
+    0x88, 0x02,  0x48, 0x05,  0x28, 0x0A,  0x58, 0x14,
+    0x30, 0x29,  0x60, 0x52,  0xC0, 0x24,  0x80, 0x49,
+    0xA0, 0x12,  0x40, 0x25,  0xE8, 0x4A,  0xD0, 0x15,
+]
 
 # Terrain height ranges per zone (top ceiling depth, bottom floor depth)
 # in logical pixel rows (0 = flush with edge, 48 = whole screen blocked)

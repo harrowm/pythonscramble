@@ -3,35 +3,33 @@ input.py - Keyboard input handler.
 
 Original Z80 sources
 --------------------
-fn_read_joystick ($6E54):
-    Reads from a lookup table at $6F5C indexed by a value at $6AB0.
-    The value at $6AB0 is an index into an input state table, masking
-    the lower 4 bits.  This is an indirect keyboard state read.
+fn_update_ship_pos ($6926):
+    Reads TRS-80 keyboard matrix to generate 4-directional movement deltas:
+        $3840 bit 6 (UP key):    B += 2  →  ship_x += 2  (move right/forward)
+        $3840 bit 5 (DOWN key):  B -= 2  →  ship_x -= 2  (move left/backward)
+        $3840 bit 3 (RIGHT key): C -= 1  →  ship_y -= 1  (move up on screen)
+        $3840 bit 4 (LEFT key):  C += 1  →  ship_y += 1  (move down on screen)
 
-The original keyboard mapping (from instruction text at $5E00):
-    "PRESS ARROW KEYS OR Q,W TO FIRE MACHINE GUN"
-    "PRESS LEFT & RIGHT SIMULTANEOUSLY TO DROP BOMBS"
-    "PRESS UP & DOWN SIMULTANEOUSLY TO DROP BOMBS"
-    "<SPACE> TO START, <SHIFT> & <BREAK> TO ABORT GAME"
+    The ship has NO gravity and NO thrust — it holds position when no key
+    is pressed.  Horizontal speed = 2 px/frame, vertical = 1 px/frame.
 
-TRS-80 keyboard rows (memory-mapped at $3800–$38FF):
-    $3880: bits 0-7 = various keys including arrow keys
-    The game reads these via IN A,(port) or direct memory reads.
+fn_fire_cannon ($66B0):
+    Reads $3840 bits 3+4 (or $3804 bits 1+7) to detect the fire button.
+    In the original, UP+RIGHT or DOWN+LEFT simultaneously fires.
+    We simplify to a single FIRE key.
+
+    Original instruction text ($5E00):
+        "<SPACE> TO START   <SHIFT> & <BREAK> TO ABORT GAME"
 
 Python/SDL2 mapping
 -------------------
-We map the original controls to a comfortable modern layout:
-
-    Arrow UP        → thrust up
-    Arrow DOWN      → (not used in classic Scramble, but some versions allow)
-    Z key           → fire machine gun (mapped from Q)
-    X key           → fire machine gun (mapped from W) -- both needed simultaneously
-    Space / Ctrl    → drop bomb
-    Enter           → start game
-    Escape          → abort / quit
-
-The original required Q+W held simultaneously to fire the machine gun.
-We simplify to a single FIRE key (Z or Space) for usability.
+    Arrow UP / W / I   → move ship up    (Z80: ship_y -= 1)
+    Arrow DOWN / S / M → move ship down  (Z80: ship_y += 1)
+    Arrow RIGHT / D    → move ship right (Z80: ship_x += 2)
+    Arrow LEFT / A     → move ship left  (Z80: ship_x -= 2)
+    Z / X / Ctrl       → fire cannon
+    Enter / Space      → start game
+    Escape             → abort / quit
 """
 
 import sdl2
@@ -47,19 +45,21 @@ class InputState:
     """
 
     __slots__ = (
-        "thrust_up",
-        "thrust_down",
+        "move_up",
+        "move_down",
+        "move_right",
+        "move_left",
         "fire",
-        "bomb",
         "start",
         "abort",
     )
 
     def __init__(self) -> None:
-        self.thrust_up:  bool = False
-        self.thrust_down: bool = False
+        self.move_up:    bool = False
+        self.move_down:  bool = False
+        self.move_right: bool = False
+        self.move_left:  bool = False
         self.fire:       bool = False
-        self.bomb:       bool = False
         self.start:      bool = False
         self.abort:      bool = False
 
@@ -81,35 +81,38 @@ class InputHandler:
         state = InputState()
         keys = sdl2.SDL_GetKeyboardState(None)
 
-        # Thrust up: arrow UP or W or I
-        state.thrust_up = bool(
+        # Move up: arrow UP or W or I  (Z80: RIGHT key → ship_y -= 1)
+        state.move_up = bool(
             keys[sdl2.SDL_SCANCODE_UP]
             or keys[sdl2.SDL_SCANCODE_W]
             or keys[sdl2.SDL_SCANCODE_I]
         )
 
-        # Thrust down: arrow DOWN or S or M
-        # (not used in original Scramble, but some ports allowed it)
-        state.thrust_down = bool(
+        # Move down: arrow DOWN or S or M  (Z80: LEFT key → ship_y += 1)
+        state.move_down = bool(
             keys[sdl2.SDL_SCANCODE_DOWN]
             or keys[sdl2.SDL_SCANCODE_S]
             or keys[sdl2.SDL_SCANCODE_M]
         )
 
-        # Fire machine gun: Z or X (original: Q+W simultaneously)
-        # Both keys can fire independently (we relax the simultaneous requirement)
+        # Move right: arrow RIGHT or D  (Z80: UP key → ship_x += 2)
+        state.move_right = bool(
+            keys[sdl2.SDL_SCANCODE_RIGHT]
+            or keys[sdl2.SDL_SCANCODE_D]
+        )
+
+        # Move left: arrow LEFT or A  (Z80: DOWN key → ship_x -= 2)
+        state.move_left = bool(
+            keys[sdl2.SDL_SCANCODE_LEFT]
+            or keys[sdl2.SDL_SCANCODE_A]
+        )
+
+        # Fire cannon: Z or X or Ctrl  (Z80: $3840 bits 3+4 or $3804 bits 1+7)
         state.fire = bool(
             keys[sdl2.SDL_SCANCODE_Z]
             or keys[sdl2.SDL_SCANCODE_X]
             or keys[sdl2.SDL_SCANCODE_LCTRL]
             or keys[sdl2.SDL_SCANCODE_RCTRL]
-        )
-
-        # Drop bomb: Space or Left-Alt (original: UP+DOWN simultaneously)
-        state.bomb = bool(
-            keys[sdl2.SDL_SCANCODE_SPACE]
-            or keys[sdl2.SDL_SCANCODE_LALT]
-            or keys[sdl2.SDL_SCANCODE_RALT]
         )
 
         # Start: Enter or Space on title screen

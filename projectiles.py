@@ -1,223 +1,164 @@
 """
-projectiles.py - Missile (machine gun) and Bomb for Scramble.
+projectiles.py - Cannon shot (player's forward-firing projectile) for Scramble.
 
 Original Z80 sources
 --------------------
-fn_fire_missile ($6A16):
-    Reads missile active state.  If not active, positions the missile at
-    the ship's nose (right edge of ship sprite) and sets active flag.
-    The missile moves rightward each frame.
+fn_fire_cannon ($66B0):
+    Reads fire buttons from TRS-80 keyboard matrix ($3840 bits 3+4, or
+    $3804 bits 1+7).  If the cannon-shot slot at $666F is empty (state=0),
+    initialises it:
+        IX+0 = 1 (active)
+        IX+1 = ship_x + 6   (shot column, starts 6 pixels ahead of ship)
+        IX+2 = ship_y + 3   (shot row,    starts 3 pixels below ship)
+        IX+3/4 = path_table_cannon ($679E)
+    Only ONE cannon shot exists at a time (single-shot system).
 
-fn_update_missile ($6A4E):
-    Increments missile x position by MISSILE_SPEED.
-    Reads video RAM at new position; if non-blank char found, it's a hit.
-    On reaching right edge of screen, deactivates missile.
+fn_update_cannon_shot ($66E9):
+    Each frame:
+        1. Check IX+2 (row counter) against terrain via fn_check_terrain_clip
+           ($69DE).
+        2. Compute VRAM address via fn_compute_vram_offset, test bitmask
+           against existing VRAM.  If overlap → collision (enemy hit).
+        3. OR bitmask into VRAM to draw the shot.
+        4. INC IX+2 (advance row by 1 per frame).
+        5. If IX+2 >= $30 (48) → deactivate (shot went out of range).
+        6. Advance path table pointer, apply Y-delta to IX+1 (column).
+           If path entry = $7F → deactivate.
 
-fn_drop_bomb ($6B98):
-    Drops a bomb from beneath the ship if none is active.
-    Bomb falls downward at BOMB_SPEED px/frame.
+path_table_cannon ($679E–$67E5):
+    Y-delta (column adjustment) sequence for the curved cannon trajectory.
+    The shot starts by curving briskly (delta +2 for 6 frames) then
+    gradually straightens (+1, then 0).
 
-fn_update_bomb ($6C59):
-    Increments bomb y position.
-    Reads video RAM at new position; if non-blank found, it's a hit.
-    On reaching bottom of screen, deactivates bomb.
-
-fn_missile_hit_test ($6AC5) and fn_bomb_hit_test ($6C88):
-    Both check the video RAM char at the projectile's position.
-    If non-blank, the projectile has hit something.
-    The specific char code determines what was hit (enemy? terrain? target?).
-
-Key constraint from the original
----------------------------------
-Only ONE missile and ONE bomb can be active at a time (single-shot system).
-This is clear from the single active-flag approach and is a defining
-characteristic of the game feel.
+Key constraint: only ONE cannon shot active at a time (slot at $666F).
 """
 
 from dataclasses import dataclass, field
 
 from constants import (
     PIXELS_WIDE, PIXELS_TALL,
-    MISSILE_SPEED_PX, MISSILE_CHAR,
-    BOMB_SPEED_PX, BOMB_CHAR,
+    CANNON_SPAWN_AHEAD, CANNON_SPAWN_BELOW,
+    CANNON_MAX_ROW, CANNON_SPEED_PX, CANNON_CHAR,
+    CANNON_PATH,
 )
 from trs80_screen import TRS80Screen
 
 
 @dataclass
-class Missile:
+class CannonShot:
     """
-    The player's forward-firing missile.
+    The player's forward-firing cannon shot.
 
-    The Z80 stores missile state in:
-        missile_col    ($6BC0) - screen column
-        missile_row    ($6BC1) - screen row
-        missile_active ($6BC2) - non-zero if in flight
+    Z80 cannon-shot slot at $666F (5 bytes):
+        +0 state   (0=inactive, 1=active)
+        +1 col     (Y in Z80 coords = horizontal column; advances with path)
+        +2 row     (X in Z80 coords = vertical row;    advances +1/frame)
+        +3 path_lo (pointer into path_table_cannon)
+        +4 path_hi
 
-    We track position in logical pixels for sub-cell accuracy.
+    In Python's horizontal-scroller view:
+        pixel_x → horizontal position (advances by CANNON_SPEED_PX)
+        pixel_y → vertical position   (adjusted by CANNON_PATH deltas)
     """
 
     pixel_x: float = 0.0
     pixel_y: float = 0.0
     active:  bool  = False
+    _path_idx: int = 0      # current index into CANNON_PATH
 
-    def fire(self, ship_nose_x: int, ship_nose_y: int) -> None:
+    def fire(self, ship_pixel_x: float, ship_pixel_y: float) -> None:
         """
-        Launch the missile from the ship's nose position.
-        Mirrors fn_fire_missile ($6A16) which positions the missile
-        at the rightmost edge of the ship sprite.
-        Only fires if no missile is currently active.
+        Launch the cannon shot from just ahead of and below the ship.
+        Mirrors fn_fire_cannon ($66CB–$66E8).
+
+        Spawn offset (from assembly):
+            shot column = ship_x + CANNON_SPAWN_AHEAD  (6 pixels ahead)
+            shot row    = ship_y + CANNON_SPAWN_BELOW  (3 pixels below)
+        Only fires if no shot is currently active (single-shot system).
         """
         if self.active:
-            return   # single-shot: must wait for current missile to expire
-        self.pixel_x = float(ship_nose_x)
-        self.pixel_y = float(ship_nose_y)
-        self.active  = True
+            return   # single-shot: wait for current shot to expire
+        self.pixel_x  = float(ship_pixel_x) + CANNON_SPAWN_AHEAD
+        self.pixel_y  = float(ship_pixel_y) + CANNON_SPAWN_BELOW
+        self._path_idx = 0
+        self.active   = True
 
     def erase(self, screen: TRS80Screen) -> None:
-        """Erase missile from screen."""
+        """Erase cannon shot from screen."""
         if not self.active:
             return
         screen.write_char(self.char_col, self.char_row, 0x20)
 
     def update(self, screen: TRS80Screen) -> bool:
         """
-        Move the missile right and check for collision.
-        Mirrors fn_update_missile ($6A4E).
+        Advance the cannon shot by one frame and check for collision.
+        Mirrors fn_update_cannon_shot ($66E9).
 
-        Returns True if the missile hit something (collision detected),
-        False if still in flight or just deactivated on screen edge.
+        Each frame:
+          • Erase at current position.
+          • Advance pixel_y (row) by +1 (shot moves in Y direction).
+          • Advance pixel_x (col) by the current CANNON_PATH delta (shot
+            curves horizontally according to the path table).
+          • Deactivate if pixel_y >= CANNON_MAX_ROW (48) or path exhausted.
+          • Collision test: read VRAM char at new cell; if non-blank, hit.
+
+        Returns True if the shot hit something (collision → caller scores),
+        False if still in flight or deactivated on boundary.
         """
         if not self.active:
             return False
 
-        # Erase at current position before moving
+        # Erase at current position
         self.erase(screen)
 
-        # Move right
-        self.pixel_x += MISSILE_SPEED_PX
+        # Advance row (Y axis) by 1 per frame (fn_update_cannon_shot INC IX+2)
+        self.pixel_y += 1.0
 
-        # Deactivate if off-screen right edge
-        if self.pixel_x >= PIXELS_WIDE:
+        # Advance column (X axis) by path-table delta (fn $6749: Y += delta)
+        if self._path_idx < len(CANNON_PATH):
+            delta = CANNON_PATH[self._path_idx]
+            self._path_idx += 1
+        else:
+            delta = 0
+
+        self.pixel_x += float(delta)
+
+        # Deactivate if row reached $30 = 48 (fn $6740: CP $30, JR NZ,.L6749)
+        if self.pixel_y >= CANNON_MAX_ROW:
             self.active = False
             return False
 
-        # Collision check: read video RAM at new position
-        char = screen.read_char(self.char_col, self.char_row)
-        if char != 0x20 and char != 0x80:
-            # Hit something - erase the cell and deactivate
-            screen.write_char(self.char_col, self.char_row, 0x20)
-            self.active = False
-            return True   # HIT
-
-        # No hit: draw missile at new position
-        screen.write_char(self.char_col, self.char_row, MISSILE_CHAR)
-        return False
-
-    def deactivate(self) -> None:
-        """Deactivate missile without collision (e.g. player died)."""
-        self.active = False
-
-    @property
-    def char_col(self) -> int:
-        return int(self.pixel_x) // 2
-
-    @property
-    def char_row(self) -> int:
-        return int(self.pixel_y) // 3
-
-    @property
-    def pixel_xi(self) -> int:
-        return int(self.pixel_x)
-
-    @property
-    def pixel_yi(self) -> int:
-        return int(self.pixel_y)
-
-
-@dataclass
-class Bomb:
-    """
-    The player's downward-falling bomb.
-
-    The Z80 stores bomb state in:
-        bomb_col    ($6A80) - screen column
-        bomb_row    ($6A81) - screen row
-        bomb_active ($6A82) - non-zero if falling
-
-    One bomb active at a time (fn_drop_bomb returns immediately if active).
-    """
-
-    pixel_x: float = 0.0
-    pixel_y: float = 0.0
-    active:  bool  = False
-
-    def drop(self, ship_pixel_x: int, ship_pixel_y: int,
-             ship_width_chars: int) -> None:
-        """
-        Drop a bomb from beneath the ship's centre.
-        Mirrors fn_drop_bomb ($6B98).
-        """
-        if self.active:
-            return  # single bomb at a time
-        # Position bomb at the bottom-centre of the ship
-        self.pixel_x = float(ship_pixel_x + ship_width_chars)
-        self.pixel_y = float(ship_pixel_y + 6)   # below the ship (2 rows × 3px)
-        self.active  = True
-
-    def erase(self, screen: TRS80Screen) -> None:
-        """Erase bomb from screen."""
-        if not self.active:
-            return
-        screen.write_char(self.char_col, self.char_row, 0x20)
-
-    def update(self, screen: TRS80Screen) -> bool:
-        """
-        Move the bomb downward and check for collision.
-        Mirrors fn_update_bomb ($6C59).
-
-        Returns True if the bomb hit something.
-        """
-        if not self.active:
-            return False
-
-        self.erase(screen)
-
-        # Move down
-        self.pixel_y += BOMB_SPEED_PX
-
-        # Deactivate if off-screen bottom
-        if self.pixel_y >= PIXELS_TALL:
+        # Deactivate if moved off the screen area
+        if self.pixel_x >= PIXELS_WIDE or self.pixel_x < 0:
             self.active = False
             return False
 
-        # Collision check at new position
+        # Collision check: read VRAM char at the shot's new cell
         char = screen.read_char(self.char_col, self.char_row)
         if char != 0x20 and char != 0x80:
             screen.write_char(self.char_col, self.char_row, 0x20)
             self.active = False
             return True   # HIT
 
-        # Draw bomb at new position
-        screen.write_char(self.char_col, self.char_row, BOMB_CHAR)
+        # No collision: draw the shot
+        screen.write_char(self.char_col, self.char_row, CANNON_CHAR)
         return False
 
     def deactivate(self) -> None:
-        """Deactivate bomb without collision."""
+        """Deactivate without collision (e.g. player died)."""
         self.active = False
 
     @property
     def char_col(self) -> int:
-        return int(self.pixel_x) // 2
+        return max(0, min(63, int(self.pixel_x) // 2))
 
     @property
     def char_row(self) -> int:
-        return int(self.pixel_y) // 3
+        return max(0, min(15, int(self.pixel_y) // 3))
 
-    @property
-    def pixel_xi(self) -> int:
-        return int(self.pixel_x)
 
-    @property
-    def pixel_yi(self) -> int:
-        return int(self.pixel_y)
+# ---------------------------------------------------------------------------
+# Backward-compatibility alias so existing imports of "Missile" still work
+# during the transition period.
+# ---------------------------------------------------------------------------
+Missile = CannonShot   # noqa: N816  (alias, not a class definition)

@@ -1,34 +1,17 @@
-"""
-game.py - Main game state machine for Scramble.
+"""game.py - Main game state machine.
 
-State machine
--------------
-The original Z80 game uses a simple loop structure with JP instructions
-to re-enter different parts of the code depending on game state.  We make
-this explicit with a Python enum and a clear update() → state transition
-model.
-
-States:
-    TITLE       - attract mode / title screen (original shows zone name)
-    PLAYING     - active gameplay
-    PLAYER_DEAD - death animation / brief pause before respawn
-    GAME_OVER   - game over screen
-    ZONE_INTRO  - brief zone announcement before flying in
-
-Original Z80 game loop (reconstructed from disassembly):
-    game_main_loop ($6200):
-        ... initialise ...
-        fn_loop_top ($6280):
+Original Z80 game loop (fn_main_game_loop $61AD):
+    fn_loop_top:
+        SCROLL terrain (every frame)
+        Every 5th frame only:
             READ keyboard
-            MOVE ship (gravity + input)
-            CHECK ship collision → if hit: fn_player_death
-            UPDATE missile
-            UPDATE bomb
-            UPDATE all enemies
-            SCROLL terrain
-            UPDATE HUD
-            DELAY (controls speed)
-            JP fn_loop_top
+            MOVE ship (4-directional, no gravity) → fn_update_ship_pos ($6926)
+            CHECK ship collision                  → fn_redraw_ship ($69A4)
+            UPDATE cannon shot                    → fn_update_cannon_shot ($66E9)
+            UPDATE all encounters                 → fn_update_all_encounters ($6C46)
+            UPDATE all enemies                    → fn_update_all_enemies ($6829)
+        UPDATE HUD
+        JP fn_loop_top
 """
 
 import sdl2
@@ -46,7 +29,7 @@ from constants import (
 from trs80_screen import TRS80Screen
 from terrain     import Terrain
 from ship        import Ship
-from projectiles import Missile, Bomb
+from projectiles import Missile
 from enemies     import EnemyManager
 from explosions  import ExplosionManager
 from hud         import HUD
@@ -78,7 +61,6 @@ class Game:
         self.terrain   = Terrain()
         self.ship      = Ship()
         self.missile   = Missile()
-        self.bomb      = Bomb()
         self.enemies   = EnemyManager()
         self.explosions = ExplosionManager()
         self.hud       = HUD()
@@ -88,8 +70,7 @@ class Game:
         self._state_timer:    int       = 0
         self._scroll_phase:   int       = DEFAULT_SCROLL_PHASE
         self._bonus_msg_timer: int      = 0
-        self._fire_cooldown:  int       = 0   # frames until next missile allowed
-        self._bomb_cooldown:  int       = 0   # frames until next bomb allowed
+        self._fire_cooldown:  int       = 0   # frames until next shot allowed
 
     # ------------------------------------------------------------------
     # Public interface
@@ -163,16 +144,17 @@ class Game:
     def _update_playing(self, inp: InputState) -> bool:
         """
         Main gameplay update.  This is the heart of the game.
-        Mirrors fn_loop_top ($6280) which runs every frame:
-            1. Read keyboard              → inp (already read by caller)
-            2. Move ship                  → ship.update()
+        Mirrors fn_main_game_loop ($61AD): terrain scrolls every frame;
+        ship/cannon/enemies only update every 5th frame in the original.
+        For simplicity we update all subsystems every frame here.
+            1. Scroll terrain             → terrain.scroll() + draw_to_screen()
+            2. Move ship                  → ship.update() / fn_update_ship_pos
             3. Check ship collision       → ship.check_terrain_collision()
-            4. Update missile             → missile.update()
-            5. Update bomb                → bomb.update()
-            6. Update enemies             → enemies.update()
-            7. Scroll terrain             → terrain.scroll() + draw_to_screen()
-            8. Update HUD                 → hud.draw()
-            9. Delay                      → handled by frame limiter in main.py
+            4. Draw ship                  → ship.draw()
+            5. Fire / update cannon       → missile.fire() + missile.update()
+            6. Update enemies             → enemies.update() / fn_update_all_enemies
+            7. Update explosions
+            8. Consume fuel               → hud.consume_fuel()
         """
         if inp.abort:
             self._transition(GameState.GAME_OVER)
@@ -185,11 +167,12 @@ class Game:
         self.terrain.draw_to_screen(self.screen)
 
         # --- 2. Move ship ---
-        # fn_move_ship ($65BF): apply gravity and thrust input.
-        self.ship.update(inp.thrust_up, inp.thrust_down)
+        # fn_update_ship_pos ($6926): 4-directional, no gravity.
+        self.ship.update(inp.move_up, inp.move_down, inp.move_right, inp.move_left)
 
         # --- 3. Check ship collision ---
-        # fn_check_ship_crash ($65C2): reads video RAM at ship position.
+        # fn_redraw_ship ($69A4) does pixel-level collision detection.
+        # fn_check_ship_crash ($65CA) processes the death event.
         # We check BEFORE drawing the ship so we detect terrain/enemy chars.
         if self.ship.check_terrain_collision(self.screen):
             self._kill_player()
@@ -202,15 +185,15 @@ class Game:
         self.ship.erase(self.screen)
         self.ship.draw(self.screen)
 
-        # --- 5. Fire missile ---
-        # Original: Q+W fires the machine gun (fn_fire_missile $6A16).
+        # --- 5. Fire cannon ---
+        # fn_fire_cannon ($66B0): single shot, spawns at ship_x+6, ship_y+3.
         if inp.fire and self._fire_cooldown == 0:
-            self.missile.fire(self.ship.nose_pixel_x, self.ship.nose_pixel_y)
+            self.missile.fire(int(self.ship.pixel_x), int(self.ship.pixel_y))
             self._fire_cooldown = 6   # brief cooldown so key-hold doesn't spam
         if self._fire_cooldown > 0:
             self._fire_cooldown -= 1
 
-        # Update missile position and check for hit
+        # Update cannon shot position and check for hit
         missile_hit = self.missile.update(self.screen)
         if missile_hit:
             hit_enemy = self.enemies.check_missile_hit(
@@ -219,28 +202,8 @@ class Game:
             if hit_enemy:
                 self._destroy_enemy(hit_enemy)
 
-        # --- 6. Drop bomb ---
-        # Original: UP+DOWN simultaneously drops a bomb (fn_drop_bomb $6B98).
-        if inp.bomb and self._bomb_cooldown == 0:
-            self.bomb.drop(
-                int(self.ship.pixel_x), int(self.ship.pixel_y),
-                SHIP_WIDTH_CHARS
-            )
-            self._bomb_cooldown = 8
-        if self._bomb_cooldown > 0:
-            self._bomb_cooldown -= 1
-
-        # Update bomb position and check for hit
-        bomb_hit = self.bomb.update(self.screen)
-        if bomb_hit:
-            hit_enemy = self.enemies.check_bomb_hit(
-                self.bomb.char_col, self.bomb.char_row
-            )
-            if hit_enemy:
-                self._destroy_enemy(hit_enemy)
-
-        # --- 7. Update enemies ---
-        # fn_update_all_enemies ($69D6)
+        # --- 6. Update enemies ---
+        # fn_update_all_enemies ($6829)
         self.enemies.update(self.screen)
 
         # Check if any enemy has flown into the ship
@@ -251,16 +214,16 @@ class Game:
             self._kill_player()
             return True
 
-        # --- 8. Update explosions ---
+        # --- 7. Update explosions ---
         self.explosions.update(self.screen)
 
-        # --- 9. Consume fuel ---
+        # --- 8. Consume fuel ---
         # fn_consume_fuel ($6D46): fuel decrements each frame.
         if self.hud.consume_fuel():
             self._kill_player()   # out of fuel → death
             return True
 
-        # --- 10. Tick bonus message display ---
+        # --- 9. Tick bonus message display ---
         if self._bonus_msg_timer > 0:
             self._bonus_msg_timer -= 1
 
@@ -314,7 +277,6 @@ class Game:
         self.terrain = Terrain()   # fresh terrain starting from zone 0
         self.ship.reset()
         self.missile.deactivate()
-        self.bomb.deactivate()
         self.enemies.set_zone(0)
         self.enemies.clear_all()
         self.explosions.clear_all()
@@ -327,7 +289,6 @@ class Game:
         self.terrain.draw_to_screen(self.screen)
         self.ship.reset()
         self._fire_cooldown = 0
-        self._bomb_cooldown = 0
         self._transition(GameState.PLAYING)
 
     def _kill_player(self) -> None:
@@ -344,7 +305,6 @@ class Game:
 
         # Deactivate all projectiles
         self.missile.deactivate()
-        self.bomb.deactivate()
 
         # Lose a life
         self.hud.lose_life()
