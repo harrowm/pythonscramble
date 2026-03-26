@@ -25,6 +25,7 @@ from constants import (
     SHIP_WIDTH_CHARS, SHIP_HEIGHT_CHARS,
     STARTING_FUEL,
     ZONE_NAMES,
+    INSTR_SCREEN_DATA, INSTR_TEXT_ROWS,
 )
 from trs80_screen import TRS80Screen
 from terrain     import Terrain
@@ -37,11 +38,12 @@ from input       import InputHandler, InputState
 
 
 class GameState(Enum):
-    TITLE       = auto()
-    ZONE_INTRO  = auto()
-    PLAYING     = auto()
-    PLAYER_DEAD = auto()
-    GAME_OVER   = auto()
+    TITLE        = auto()
+    INSTRUCTIONS = auto()
+    ZONE_INTRO   = auto()
+    PLAYING      = auto()
+    PLAYER_DEAD  = auto()
+    GAME_OVER    = auto()
 
 
 class Game:
@@ -71,6 +73,8 @@ class Game:
         self._scroll_phase:   int       = DEFAULT_SCROLL_PHASE
         self._bonus_msg_timer: int      = 0
         self._fire_cooldown:  int       = 0   # frames until next shot allowed
+        self._instr_phase:    int       = 0   # 0 = bonus-text overlay, 1 = score table
+        self._instr_scroll:   int       = 0   # left-scroll offset for panorama
 
     # ------------------------------------------------------------------
     # Public interface
@@ -86,6 +90,8 @@ class Game:
 
         if self._state == GameState.TITLE:
             return self._update_title(input_state)
+        elif self._state == GameState.INSTRUCTIONS:
+            return self._update_instructions(input_state)
         elif self._state == GameState.ZONE_INTRO:
             return self._update_zone_intro()
         elif self._state == GameState.PLAYING:
@@ -116,8 +122,10 @@ class Game:
     def _update_title(self, inp: InputState) -> bool:
         """
         Attract / title state.
-        The original game shows the instruction text (stored at $5E00)
-        and waits for SPACE.
+        Waits for SPACE (start) or I (instructions).
+        In the original (.title_loop at $60F3) the title screen is always
+        visible; pressing I overlays the bonus-life text WITHOUT clearing
+        the screen.
         """
         if inp.abort:
             return False   # quit
@@ -125,8 +133,57 @@ class Game:
         if self._state_timer == 1:
             self._draw_title_screen()
 
+        if inp.instructions and self._state_timer > 10:
+            self._instr_phase = 1
+            self._instr_scroll = 0
+            self._transition(GameState.INSTRUCTIONS)
+            self._draw_score_table()
+
         if inp.start and self._state_timer > 10:
             self._start_game()
+
+        return True
+
+    def _update_instructions(self, inp: InputState) -> bool:
+        """
+        Instructions state — two phases matching the original:
+
+        Phase 0  (fn_show_bonus_life_text / .wait_for_space at $6118):
+            Title screen stays fully visible; "* BONUS LIFE ... *" is
+            overlaid at row 4 col 14.  SPACE → start game.  Any other
+            key → phase 1.
+
+        Phase 1  (.instr_show at $6135 in the original):
+            Scrolling score table.  We show a static rendition.
+            Any key → back to title.
+        """
+        if self._instr_phase == 0:
+            if inp.start and self._state_timer > 10:
+                self._start_game()
+                return True
+            # Any key other than I (which we already handled) advances
+            # to the score-table phase.
+            any_key = (
+                inp.abort or inp.move_up or inp.move_down
+                or inp.move_left or inp.move_right or inp.fire
+            )
+            if any_key and self._state_timer > 10:
+                self._instr_phase = 1
+                self._instr_scroll = 0
+                self._state_timer = 0
+                self._draw_score_table()
+        else:
+            # Phase 1: score table on screen; any key returns to title.
+            self._instr_scroll += 1
+            self._draw_score_table()
+            any_key = (
+                inp.abort or inp.start or inp.instructions
+                or inp.move_up or inp.move_down
+                or inp.move_left or inp.move_right or inp.fire
+            )
+            if any_key and self._state_timer > 10:
+                self._transition(GameState.TITLE)
+                self._draw_title_screen()
 
         return True
 
@@ -339,6 +396,48 @@ class Game:
     # ------------------------------------------------------------------
     # Screen drawing helpers
     # ------------------------------------------------------------------
+
+    def _overlay_bonus_life_text(self) -> None:
+        """
+        Overlay "* BONUS LIFE FOR EVERY 10000 SCORED *" on the CURRENT screen.
+        Mirrors fn_show_bonus_life_text ($6210):
+            LDIR str_bonus_life ($621F, 37 bytes) → splash back-buffer at $550E.
+            $550E - $5400 = $10E = 270 bytes into VRAM → row 4, col 14.
+        Title screen remains fully visible as background.
+        """
+        bonus = "* BONUS LIFE FOR EVERY 10000 SCORED *"
+        # $550E offset = 270 bytes = row 4 (4*64=256), col 14 (270-256=14)
+        self.screen.write_string(14, 4, bonus)
+
+    def _draw_score_table(self) -> None:
+        """Draw the instructions screen using actual ROM data.
+
+        Matches the original Z80 layout:
+          Rows 0-4:  five instruction text lines from INSTR_TEXT_ROWS
+          Row  4:    * BONUS LIFE * overlay (written on top of row 4 text)
+          Rows 5-12: 8 rows of scrolling semigraphic panorama (INSTR_SCREEN_DATA)
+          Rows 13-15: blank (0x80)
+        The panorama scrolls left by 1 column per frame, wrapping every 64 cols.
+        """
+        self.screen.fill_rect(0, 0, SCREEN_CHARS_WIDE, SCREEN_CHARS_TALL, 0x80)
+
+        # Rows 0-4: instruction text (verbatim from Z80 $5D40-$5E7F)
+        for row_idx, line in enumerate(INSTR_TEXT_ROWS):
+            self.screen.write_string(0, row_idx, line[:SCREEN_CHARS_WIDE])
+
+        # Row 4: bonus life overlay (matches fn_show_bonus_life_text)
+        self._overlay_bonus_life_text()
+
+        # Rows 5-12: scrolling semigraphic enemy/score panorama
+        off = self._instr_scroll % 64
+        for prow in range(8):
+            for col in range(SCREEN_CHARS_WIDE):
+                src = prow * 64 + (col + off) % 64
+                self.screen.write_char(col, 5 + prow, INSTR_SCREEN_DATA[src])
+
+    def _draw_instructions_screen(self) -> None:
+        """Legacy wrapper — calls _draw_score_table for backward compat."""
+        self._draw_score_table()
 
     def _draw_title_screen(self) -> None:
         """Draw the title/attract screen matching the original TRS-80 layout.

@@ -52,16 +52,18 @@ class InputState:
         "fire",
         "start",
         "abort",
+        "instructions",
     )
 
     def __init__(self) -> None:
-        self.move_up:    bool = False
-        self.move_down:  bool = False
-        self.move_right: bool = False
-        self.move_left:  bool = False
-        self.fire:       bool = False
-        self.start:      bool = False
-        self.abort:      bool = False
+        self.move_up:      bool = False
+        self.move_down:    bool = False
+        self.move_right:   bool = False
+        self.move_left:    bool = False
+        self.fire:         bool = False
+        self.start:        bool = False
+        self.abort:        bool = False
+        self.instructions: bool = False
 
 
 class InputHandler:
@@ -81,11 +83,10 @@ class InputHandler:
         state = InputState()
         keys = sdl2.SDL_GetKeyboardState(None)
 
-        # Move up: arrow UP or W or I  (Z80: RIGHT key → ship_y -= 1)
+        # Move up: arrow UP or W  (Z80: RIGHT key → ship_y -= 1)
         state.move_up = bool(
             keys[sdl2.SDL_SCANCODE_UP]
             or keys[sdl2.SDL_SCANCODE_W]
-            or keys[sdl2.SDL_SCANCODE_I]
         )
 
         # Move down: arrow DOWN or S or M  (Z80: LEFT key → ship_y += 1)
@@ -123,5 +124,8 @@ class InputHandler:
 
         # Abort: Escape (original: Shift + Break)
         state.abort = bool(keys[sdl2.SDL_SCANCODE_ESCAPE])
+
+        # Instructions screen: I key (title screen only)
+        state.instructions = bool(keys[sdl2.SDL_SCANCODE_I])
 
         return state
