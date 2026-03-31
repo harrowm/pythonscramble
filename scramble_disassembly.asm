@@ -16,13 +16,15 @@
 ;                LDIR at $60D7.  NOT in the CMD file; RAM is allocated by LDOS.
 ;   $5800-$5FFF  LDOS SVC stubs (game-supplied; loaded from CMD file)
 ;                $5800  JP $580F   SVC_DISPLAY  → screen wipe/blit animation
-;                $5803  JP $59DD   SVC_KEYBOARD → keyboard read
-;                $5806  JP $59CB   SVC_KEYBOARD2
+;                $5803  JP $59DD   SVC_CLR_BUF  → fills $5400-$57FF with $80 (clear back-buffer)
+;                $5806  JP $59CB   SVC_DRAW_TITLE_FRAME → clear + draw border + copy title text strings
 ;                $5809  JP $59D4   SVC_MISC     → build splash-screen back-buffer
 ;                                                 (clear + compose + draw box)
 ;                $580C  JP $5D2E   SVC_MISC2
 ;                $580F-$5FFF  SVC implementation routines:
-;                  $59DD  fn_clear_splash_buffer  fills $5400 with $80 (blank)
+;                  $59CB  fn_draw_title_frame    CALL $59DD (clear), CALL $59EB (draw border), JP $5A28 (copy strings)
+;                  $59DD  fn_clear_splash_buffer  fills $5400-$57FF entirely with $80 (blank semigraphic)
+;                  $59EB  fn_draw_border          row 0 → $84, row 15 → $81, left/right cols → $85 (box borders)
 ;                  $5A4D  fn_copy_until_at        copy @-terminated string to VRAM
 ;                  $5A56  fn_draw_title_graphics  compose title into $5400:
 ;                           row 0  col 4   "KANSAS SOFTWARE ***"         ($5B6C)
@@ -61,6 +63,27 @@
 ;   (Earlier documentation incorrectly stated $6200 as the entry point.
 ;    The CMD transfer record in ARCBOMB1/CMD specifies $60B0.)
 ;
+; SCREEN DISPLAY MODEL:
+;   There are TWO 1KB LDIR blits to VRAM in the game:
+;
+;   BLIT 1 — SPLASH/TITLE SCREEN ($60D7):
+;     LDIR $5400 → $3C00 (1024 bytes)
+;     Source $5400-$57FF is a RAM back-buffer built on-the-fly by code.
+;     It is NOT a pre-stored blob in the CMD file.
+;     Built by fn_draw_title_graphics ($5A56) + fn_draw_top_five_box ($5ADC)
+;     which copy ASCII strings and semigraphic tiles from $5B6C/$5B80/$5BAF/$5BD3
+;     (embedded inside the SVC code block at $5800-$5DFF) into the back-buffer.
+;
+;   BLIT 2 — GAME DISPLAY PAGE ($6F2C, called every frame via fn_copy_screen_row):
+;     LDIR ($6AB2) → $3C00 (1024 bytes)
+;     $6AB2 = ship_vram_off = game display buffer base = $73CC (initial CMD value).
+;     The 2KB game back-buffer at $73CC-$7BCB is filled by fn_clear_buffers ($643C)
+;     and painted by all rendering routines.  Each frame the first 1KB is blitted
+;     to live VRAM by fn_copy_screen_row ($6F23).
+;     During the instructions animation, fn_scroll_screen ($64CA) renders the
+;     @-terminated source data from $5E00-$60AF into $73CC, then fn_copy_screen_row
+;     blits it to VRAM.  The instructions text scrolls right-to-left.
+;
 ; SPLASH SCREEN SEQUENCE (what you see on boot):
 ;   1. fn_game_entry ($60B0) initialises stack and clears LDOS hook.
 ;   2. CALL $5809 (SVC_MISC) → fn_clear_splash_buffer + fn_draw_title_graphics
@@ -84,6 +107,658 @@
 ;   Q key:  fires machine gun (with W)
 ;   W key:  fires machine gun (with Q)
 ; ====================================================================
+
+
+; ====================================================================
+; SVC BLOCK  ($5800-$5DFF)
+; ====================================================================
+; Game-supplied LDOS SVC stubs, jump table, and implementation routines.
+; Loaded from ARCBOMB1.CMD into RAM at $5800.
+; ====================================================================
+
+
+; ====================================================================
+; SVC JUMP TABLE  ($5800-$580E)
+; ====================================================================
+; The game installs 5 SVC vectors in the LDOS SVC table.
+; Each is a 3-byte JP instruction that vectors into the implementation code below.
+; ====================================================================
+
+svc_jump_table:   ; $5800
+    JP $580F                            ; 5800: C3 0F 58
+SVC_CLR_BUF:   ; $5803
+    JP $59DD                            ; 5803: C3 DD 59
+SVC_DRAW_TITLE_FRAME:   ; $5806
+    JP $59CB                            ; 5806: C3 CB 59
+SVC_MISC:   ; $5809
+    JP $59D4                            ; 5809: C3 D4 59
+SVC_MISC2:   ; $580C
+    JP $5D2E                            ; 580C: C3 2E 5D
+
+; ====================================================================
+; fn_svc_display  ($580F)
+; Wipes/animates the transition before blitting back-buffer to VRAM.
+; Called as: CALL $5800
+; ====================================================================
+
+fn_svc_display:   ; $580F
+    LD A,R                              ; 580F: ED 5F
+    AND $03                             ; 5811: E6 03
+    CP $00                              ; 5813: FE 00
+    JP Z,$5825                          ; 5815: CA 25 58
+    CP $01                              ; 5818: FE 01
+    JP Z,$582A                          ; 581A: CA 2A 58
+    CP $03                              ; 581D: FE 03
+    JP Z,$5907                          ; 581F: CA 07 59
+    JP $5982                            ; 5822: C3 82 59
+    LD HL,$004B                         ; 5825: 21 4B 00
+    JR $582D                            ; 5828: 18 03
+    LD HL,$0005                         ; 582A: 21 05 00
+    LD ($5905),HL                       ; 582D: 22 05 59
+    LD HL,$3BFF                         ; 5830: 21 FF 3B
+    LD D,$40                            ; 5833: 16 40
+    LD E,$0F                            ; 5835: 1E 0F
+    LD B,D                              ; 5837: 42
+    INC HL                              ; 5838: 23
+    LD (HL),$BF                         ; 5839: 36 BF
+    CALL $58E2                          ; 583B: CD E2 58
+    DJNZ $5838                          ; 583E: 10 F8
+    CALL $58EC                          ; 5840: CD EC 58
+    LD B,E                              ; 5843: 43
+    PUSH BC                             ; 5844: C5
+    LD BC,$0040                         ; 5845: 01 40 00
+    ADD HL,BC                           ; 5848: 09
+    LD (HL),$BF                         ; 5849: 36 BF
+    POP BC                              ; 584B: C1
+    CALL $58E2                          ; 584C: CD E2 58
+    DJNZ $5844                          ; 584F: 10 F3
+    CALL $58EC                          ; 5851: CD EC 58
+    DEC D                               ; 5854: 15
+    DEC E                               ; 5855: 1D
+    LD B,D                              ; 5856: 42
+    DEC HL                              ; 5857: 2B
+    LD (HL),$BF                         ; 5858: 36 BF
+    CALL $58E2                          ; 585A: CD E2 58
+    DJNZ $5857                          ; 585D: 10 F8
+    CALL $58EC                          ; 585F: CD EC 58
+    LD A,D                              ; 5862: 7A
+    CP $31                              ; 5863: FE 31
+    JR Z,$587E                          ; 5865: 28 17
+    LD B,E                              ; 5867: 43
+    PUSH BC                             ; 5868: C5
+    OR A                                ; 5869: B7
+    LD BC,$0040                         ; 586A: 01 40 00
+    SBC HL,BC                           ; 586D: ED 42
+    LD (HL),$BF                         ; 586F: 36 BF
+    POP BC                              ; 5871: C1
+    CALL $58E2                          ; 5872: CD E2 58
+    DJNZ $5868                          ; 5875: 10 F1
+    CALL $58EC                          ; 5877: CD EC 58
+    DEC D                               ; 587A: 15
+    DEC E                               ; 587B: 1D
+    JR $5837                            ; 587C: 18 B9
+    LD E,$01                            ; 587E: 1E 01
+    LD IX,$5607                         ; 5880: DD 21 07 56
+    LD A,(IX+0)                         ; 5884: DD 7E 00
+    LD (HL),A                           ; 5887: 77
+    LD B,D                              ; 5888: 42
+    INC HL                              ; 5889: 23
+    INC IX                              ; 588A: DD 23
+    LD A,(IX+0)                         ; 588C: DD 7E 00
+    LD (HL),A                           ; 588F: 77
+    CALL $58E2                          ; 5890: CD E2 58
+    DJNZ $5889                          ; 5893: 10 F4
+    CALL $58EC                          ; 5895: CD EC 58
+    LD B,E                              ; 5898: 43
+    PUSH BC                             ; 5899: C5
+    OR A                                ; 589A: B7
+    LD BC,$0040                         ; 589B: 01 40 00
+    SBC HL,BC                           ; 589E: ED 42
+    LD B,$40                            ; 58A0: 06 40
+    DEC IX                              ; 58A2: DD 2B
+    DJNZ $58A2                          ; 58A4: 10 FC
+    LD A,(IX+0)                         ; 58A6: DD 7E 00
+    LD (HL),A                           ; 58A9: 77
+    POP BC                              ; 58AA: C1
+    CALL $58E2                          ; 58AB: CD E2 58
+    DJNZ $5899                          ; 58AE: 10 E9
+    CALL $58EC                          ; 58B0: CD EC 58
+    INC E                               ; 58B3: 1C
+    INC D                               ; 58B4: 14
+    LD B,D                              ; 58B5: 42
+    DEC HL                              ; 58B6: 2B
+    DEC IX                              ; 58B7: DD 2B
+    LD A,(IX+0)                         ; 58B9: DD 7E 00
+    LD (HL),A                           ; 58BC: 77
+    CALL $58E2                          ; 58BD: CD E2 58
+    DJNZ $58B6                          ; 58C0: 10 F4
+    CALL $58EC                          ; 58C2: CD EC 58
+    LD A,D                              ; 58C5: 7A
+    CP $40                              ; 58C6: FE 40
+    RET Z                               ; 58C8: C8
+    LD B,E                              ; 58C9: 43
+    PUSH BC                             ; 58CA: C5
+    LD BC,$0040                         ; 58CB: 01 40 00
+    ADD HL,BC                           ; 58CE: 09
+    DB $DD,$09                          ; 58CF: DD 09
+    LD A,(IX+0)                         ; 58D1: DD 7E 00
+    LD (HL),A                           ; 58D4: 77
+    POP BC                              ; 58D5: C1
+    CALL $58E2                          ; 58D6: CD E2 58
+    DJNZ $58CA                          ; 58D9: 10 EF
+    CALL $58EC                          ; 58DB: CD EC 58
+    INC D                               ; 58DE: 14
+    INC E                               ; 58DF: 1C
+    JR $5888                            ; 58E0: 18 A6
+    PUSH BC                             ; 58E2: C5
+    LD BC,($5905)                       ; 58E3: ED 4B 05 59
+    CALL $0060                          ; 58E7: CD 60 00
+    POP BC                              ; 58EA: C1
+    RET                                 ; 58EB: C9
+    PUSH BC                             ; 58EC: C5
+    PUSH DE                             ; 58ED: D5
+    LD C,$0A                            ; 58EE: 0E 0A
+    LD B,D                              ; 58F0: 42
+    LD A,$01                            ; 58F1: 3E 01
+    OUT ($FF),A                         ; 58F3: D3 FF
+    DJNZ $58F5                          ; 58F5: 10 FE
+    LD B,$14                            ; 58F7: 06 14
+    LD A,$02                            ; 58F9: 3E 02
+    OUT ($FF),A                         ; 58FB: D3 FF
+    DJNZ $58FD                          ; 58FD: 10 FE
+    DEC C                               ; 58FF: 0D
+    JR NZ,$58F0                         ; 5900: 20 EE
+    POP DE                              ; 5902: D1
+    POP BC                              ; 5903: C1
+    RET                                 ; 5904: C9
+    LD C,E                              ; 5905: 4B
+    NOP                                 ; 5906: 00
+    LD HL,$3FFF                         ; 5907: 21 FF 3F
+    LD DE,$3FFE                         ; 590A: 11 FE 3F
+    EXX                                 ; 590D: D9
+    LD HL,$3C00                         ; 590E: 21 00 3C
+    LD DE,$3C01                         ; 5911: 11 01 3C
+    LD A,$08                            ; 5914: 3E 08
+    CALL $595D                          ; 5916: CD 5D 59
+    CALL $5968                          ; 5919: CD 68 59
+    LD BC,$0040                         ; 591C: 01 40 00
+    LD (HL),$BF                         ; 591F: 36 BF
+    LDIR                                ; 5921: ED B0
+    LD (HL),$80                         ; 5923: 36 80
+    EXX                                 ; 5925: D9
+    LD BC,$0040                         ; 5926: 01 40 00
+    LD (HL),$BF                         ; 5929: 36 BF
+    LDDR                                ; 592B: ED B8
+    LD (HL),$80                         ; 592D: 36 80
+    EXX                                 ; 592F: D9
+    DEC A                               ; 5930: 3D
+    JR NZ,$5916                         ; 5931: 20 E3
+    LD HL,$3DFF                         ; 5933: 21 FF 3D
+    LD (HL),$BF                         ; 5936: 36 BF
+    LD HL,$5600                         ; 5938: 21 00 56
+    LD DE,$3E00                         ; 593B: 11 00 3E
+    EXX                                 ; 593E: D9
+    LD HL,$55FF                         ; 593F: 21 FF 55
+    LD DE,$3DFF                         ; 5942: 11 FF 3D
+    CALL $595D                          ; 5945: CD 5D 59
+    CALL $5968                          ; 5948: CD 68 59
+    LD BC,$0040                         ; 594B: 01 40 00
+    LDDR                                ; 594E: ED B8
+    EXX                                 ; 5950: D9
+    LD BC,$0040                         ; 5951: 01 40 00
+    LDIR                                ; 5954: ED B0
+    LD A,$40                            ; 5956: 3E 40
+    CP D                                ; 5958: BA
+    RET Z                               ; 5959: C8
+    EXX                                 ; 595A: D9
+    JR $5945                            ; 595B: 18 E8
+    PUSH AF                             ; 595D: F5
+    PUSH BC                             ; 595E: C5
+    LD BC,$03E8                         ; 595F: 01 E8 03
+    CALL $0060                          ; 5962: CD 60 00
+    POP BC                              ; 5965: C1
+    POP AF                              ; 5966: F1
+    RET                                 ; 5967: C9
+    PUSH AF                             ; 5968: F5
+    PUSH BC                             ; 5969: C5
+    LD C,$C8                            ; 596A: 0E C8
+    LD B,$0C                            ; 596C: 06 0C
+    LD A,$01                            ; 596E: 3E 01
+    OUT ($FF),A                         ; 5970: D3 FF
+    DJNZ $5972                          ; 5972: 10 FE
+    LD B,$0F                            ; 5974: 06 0F
+    LD A,$02                            ; 5976: 3E 02
+    OUT ($FF),A                         ; 5978: D3 FF
+    DJNZ $597A                          ; 597A: 10 FE
+    DEC C                               ; 597C: 0D
+    JR NZ,$596C                         ; 597D: 20 ED
+    POP BC                              ; 597F: C1
+    POP AF                              ; 5980: F1
+    RET                                 ; 5981: C9
+    LD A,$10                            ; 5982: 3E 10
+    LD HL,$5400                         ; 5984: 21 00 54
+    PUSH HL                             ; 5987: E5
+    PUSH AF                             ; 5988: F5
+    LD HL,$3C40                         ; 5989: 21 40 3C
+    LD DE,$3C00                         ; 598C: 11 00 3C
+    LD BC,$03C0                         ; 598F: 01 C0 03
+    LD A,(HL)                           ; 5992: 7E
+    LD (DE),A                           ; 5993: 12
+    INC HL                              ; 5994: 23
+    INC DE                              ; 5995: 13
+    DEC BC                              ; 5996: 0B
+    LD A,E                              ; 5997: 7B
+    AND $FF                             ; 5998: E6 FF
+    CP $1E                              ; 599A: FE 1E
+    CALL C,$59B3                        ; 599C: DC B3 59
+    LD A,B                              ; 599F: 78
+    OR C                                ; 59A0: B1
+    JR NZ,$5992                         ; 59A1: 20 EF
+    POP AF                              ; 59A3: F1
+    POP HL                              ; 59A4: E1
+    LD DE,$3FC0                         ; 59A5: 11 C0 3F
+    LD BC,$0040                         ; 59A8: 01 40 00
+    LDIR                                ; 59AB: ED B0
+    PUSH HL                             ; 59AD: E5
+    DEC A                               ; 59AE: 3D
+    JR NZ,$5988                         ; 59AF: 20 D7
+    POP HL                              ; 59B1: E1
+    RET                                 ; 59B2: C9
+    PUSH AF                             ; 59B3: F5
+    PUSH BC                             ; 59B4: C5
+    LD C,$01                            ; 59B5: 0E 01
+    LD B,E                              ; 59B7: 43
+    LD A,$01                            ; 59B8: 3E 01
+    OUT ($FF),A                         ; 59BA: D3 FF
+    DJNZ $59BC                          ; 59BC: 10 FE
+    LD B,D                              ; 59BE: 42
+    LD A,$02                            ; 59BF: 3E 02
+    OUT ($FF),A                         ; 59C1: D3 FF
+    DJNZ $59C3                          ; 59C3: 10 FE
+    DEC C                               ; 59C5: 0D
+    JR NZ,$59B7                         ; 59C6: 20 EF
+    POP BC                              ; 59C8: C1
+    POP AF                              ; 59C9: F1
+    RET                                 ; 59CA: C9
+
+; ====================================================================
+; fn_draw_title_frame  ($59CB)
+; Clears back-buffer, draws semigraphic box border, copies title strings.
+; Called as: CALL $5806  (SVC_DRAW_TITLE_FRAME)
+; ====================================================================
+
+fn_draw_title_frame:   ; $59CB
+    CALL $59DD                          ; 59CB: CD DD 59
+    CALL $59EB                          ; 59CE: CD EB 59
+    JP $5A28                            ; 59D1: C3 28 5A
+
+; ====================================================================
+; fn_draw_splash_composite  ($59D4)
+; Calls fn_clear_splash_buffer + fn_draw_title_graphics + fn_draw_top_five_box.
+; Called as: CALL $5809  (SVC_MISC)
+; ====================================================================
+
+fn_draw_splash_composite:   ; $59D4
+    CALL $59DD                          ; 59D4: CD DD 59
+    CALL $5A56                          ; 59D7: CD 56 5A
+    JP $5ADC                            ; 59DA: C3 DC 5A
+
+; ====================================================================
+; fn_clear_splash_buffer  ($59DD)
+; Fills $5400-$57FF with $80 (blank semigraphic) using LDIR.
+; Called as: CALL $5803 (SVC_CLR_BUF) or internally.
+; ====================================================================
+
+fn_clear_splash_buffer:   ; $59DD
+    LD HL,$5400                         ; 59DD: 21 00 54
+    LD DE,$5401                         ; 59E0: 11 01 54
+    LD BC,$03FF                         ; 59E3: 01 FF 03
+    LD (HL),$80                         ; 59E6: 36 80
+    LDIR                                ; 59E8: ED B0
+    RET                                 ; 59EA: C9
+
+; ====================================================================
+; fn_draw_border  ($59EB)
+; Draws semigraphic box border into back-buffer:
+;   Row  0  (offset $5400 + 0*64 = $5400): fill with $84 (top-bar chars)
+;   Row 15  (offset $5400 + 15*64 = $5600+): fill with $81 (bottom-bar)
+;   Left/right cols: fill with $85 (side-bar)
+; ====================================================================
+
+fn_draw_border:   ; $59EB
+    LD HL,$5400                         ; 59EB: 21 00 54
+    LD DE,$5401                         ; 59EE: 11 01 54
+    LD BC,$003F                         ; 59F1: 01 3F 00
+    LD (HL),$84                         ; 59F4: 36 84
+    LDIR                                ; 59F6: ED B0
+    LD HL,$57C0                         ; 59F8: 21 C0 57
+    LD DE,$57C1                         ; 59FB: 11 C1 57
+    LD BC,$003F                         ; 59FE: 01 3F 00
+    LD (HL),$81                         ; 5A01: 36 81
+    LDIR                                ; 5A03: ED B0
+    LD HL,$5400                         ; 5A05: 21 00 54
+    LD BC,$000E                         ; 5A08: 01 0E 00
+    LD DE,$0040                         ; 5A0B: 11 40 00
+    ADD HL,DE                           ; 5A0E: 19
+    LD (HL),$85                         ; 5A0F: 36 85
+    DEC BC                              ; 5A11: 0B
+    LD A,B                              ; 5A12: 78
+    OR C                                ; 5A13: B1
+    JR NZ,$5A0B                         ; 5A14: 20 F5
+    LD HL,$543F                         ; 5A16: 21 3F 54
+    LD BC,$000E                         ; 5A19: 01 0E 00
+    LD DE,$0040                         ; 5A1C: 11 40 00
+    ADD HL,DE                           ; 5A1F: 19
+    LD (HL),$85                         ; 5A20: 36 85
+    DEC BC                              ; 5A22: 0B
+    LD A,B                              ; 5A23: 78
+    OR C                                ; 5A24: B1
+    JR NZ,$5A1C                         ; 5A25: 20 F5
+    RET                                 ; 5A27: C9
+
+; ====================================================================
+; fn_copy_title_strings  ($5A28)
+; Copies @-terminated strings from embedded data into specific
+; back-buffer positions for the title screen layout.
+; ====================================================================
+
+fn_copy_title_strings:   ; $5A28
+    LD HL,$5B22                         ; 5A28: 21 22 5B
+    LD DE,$5599                         ; 5A2B: 11 99 55
+    CALL $5A4D                          ; 5A2E: CD 4D 5A
+    LD HL,$5B32                         ; 5A31: 21 32 5B
+    LD DE,$5612                         ; 5A34: 11 12 56
+    CALL $5A4D                          ; 5A37: CD 4D 5A
+    LD HL,$5B4F                         ; 5A3A: 21 4F 5B
+    LD DE,$565A                         ; 5A3D: 11 5A 56
+    CALL $5A4D                          ; 5A40: CD 4D 5A
+    LD HL,$5B5C                         ; 5A43: 21 5C 5B
+    LD DE,$56D5                         ; 5A46: 11 D5 56
+    CALL $5A4D                          ; 5A49: CD 4D 5A
+    RET                                 ; 5A4C: C9
+
+; ====================================================================
+; fn_copy_until_at  ($5A4D)
+; Copies bytes from (HL) to (DE) until byte == $40 ('@') is found.
+; Advances HL and DE past the string. $40 is NOT copied (terminator).
+; ====================================================================
+
+fn_copy_until_at:   ; $5A4D
+    LD A,(HL)                           ; 5A4D: 7E
+    CP $40                              ; 5A4E: FE 40
+    RET Z                               ; 5A50: C8
+    LD (DE),A                           ; 5A51: 12
+    INC DE                              ; 5A52: 13
+    INC HL                              ; 5A53: 23
+    JR $5A4D                            ; 5A54: 18 F7
+
+; ====================================================================
+; fn_draw_title_graphics  ($5A56)
+; Blits the composed title art (big "Arcade Bomber SCRAMBLE" semigraphic
+; letters) and text strings into the back-buffer at $5400.
+; String data lives at $5B6C, $5B80, $5BAF, $5BD3 (below).
+; ====================================================================
+
+fn_draw_title_graphics:   ; $5A56
+    LD HL,$5B6C                         ; 5A56: 21 6C 5B
+    LD DE,$5404                         ; 5A59: 11 04 54
+    CALL $5A4D                          ; 5A5C: CD 4D 5A
+    LD HL,$5B80                         ; 5A5F: 21 80 5B
+    LD DE,$5744                         ; 5A62: 11 44 57
+    CALL $5A4D                          ; 5A65: CD 4D 5A
+    LD HL,$5BAF                         ; 5A68: 21 AF 5B
+    LD DE,$57CA                         ; 5A6B: 11 CA 57
+    CALL $5A4D                          ; 5A6E: CD 4D 5A
+    LD B,$18                            ; 5A71: 06 18
+    LD HL,$5BE0                         ; 5A73: 21 E0 5B
+    LD DE,$5445                         ; 5A76: 11 45 54
+    CALL $5AD5                          ; 5A79: CD D5 5A
+    LD B,$1E                            ; 5A7C: 06 1E
+    LD HL,$5BF8                         ; 5A7E: 21 F8 5B
+    LD DE,$5484                         ; 5A81: 11 84 54
+    CALL $5AD5                          ; 5A84: CD D5 5A
+    LD B,$1E                            ; 5A87: 06 1E
+    LD HL,$5C16                         ; 5A89: 21 16 5C
+    LD DE,$54C4                         ; 5A8C: 11 C4 54
+    CALL $5AD5                          ; 5A8F: CD D5 5A
+    LD B,$23                            ; 5A92: 06 23
+    LD HL,$5C34                         ; 5A94: 21 34 5C
+    LD DE,$5544                         ; 5A97: 11 44 55
+    CALL $5AD5                          ; 5A9A: CD D5 5A
+    LD B,$24                            ; 5A9D: 06 24
+    LD HL,$5C57                         ; 5A9F: 21 57 5C
+    LD DE,$5584                         ; 5AA2: 11 84 55
+    CALL $5AD5                          ; 5AA5: CD D5 5A
+    LD B,$24                            ; 5AA8: 06 24
+    LD HL,$5C7B                         ; 5AAA: 21 7B 5C
+    LD DE,$55C4                         ; 5AAD: 11 C4 55
+    CALL $5AD5                          ; 5AB0: CD D5 5A
+    LD B,$30                            ; 5AB3: 06 30
+    LD HL,$5C9F                         ; 5AB5: 21 9F 5C
+    LD DE,$5644                         ; 5AB8: 11 44 56
+    CALL $5AD5                          ; 5ABB: CD D5 5A
+    LD B,$2F                            ; 5ABE: 06 2F
+    LD HL,$5CCF                         ; 5AC0: 21 CF 5C
+    LD DE,$5684                         ; 5AC3: 11 84 56
+    CALL $5AD5                          ; 5AC6: CD D5 5A
+    LD B,$30                            ; 5AC9: 06 30
+    LD HL,$5CFE                         ; 5ACB: 21 FE 5C
+    LD DE,$56C4                         ; 5ACE: 11 C4 56
+    CALL $5AD5                          ; 5AD1: CD D5 5A
+    RET                                 ; 5AD4: C9
+    LD A,(HL)                           ; 5AD5: 7E
+    LD (DE),A                           ; 5AD6: 12
+    INC DE                              ; 5AD7: 13
+    INC HL                              ; 5AD8: 23
+    DJNZ $5AD5                          ; 5AD9: 10 FA
+    RET                                 ; 5ADB: C9
+
+; ====================================================================
+; fn_draw_top_five_box  ($5ADC)
+; Draws the "*TOP FIVE*" score-table border box in the top-right corner
+; of the back-buffer (rows 0-7, cols 46-63).
+; Uses: $B0 (top bar), $83 (bottom bar), $BF (solid block) chars.
+; String "* TOP FIVE *" from $5BD3.
+; ====================================================================
+
+fn_draw_top_five_box:   ; $5ADC
+    LD HL,$542E                         ; 5ADC: 21 2E 54
+    LD DE,$542F                         ; 5ADF: 11 2F 54
+    LD BC,$0011                         ; 5AE2: 01 11 00
+    LD (HL),$B0                         ; 5AE5: 36 B0
+    LDIR                                ; 5AE7: ED B0
+    LD HL,$55EE                         ; 5AE9: 21 EE 55
+    LD DE,$55EF                         ; 5AEC: 11 EF 55
+    LD BC,$0011                         ; 5AEF: 01 11 00
+    LD (HL),$83                         ; 5AF2: 36 83
+    LDIR                                ; 5AF4: ED B0
+    LD HL,$542E                         ; 5AF6: 21 2E 54
+    LD BC,$0006                         ; 5AF9: 01 06 00
+    LD DE,$0040                         ; 5AFC: 11 40 00
+    ADD HL,DE                           ; 5AFF: 19
+    LD (HL),$BF                         ; 5B00: 36 BF
+    DEC BC                              ; 5B02: 0B
+    LD A,B                              ; 5B03: 78
+    OR C                                ; 5B04: B1
+    JR NZ,$5AFC                         ; 5B05: 20 F5
+    LD HL,$543F                         ; 5B07: 21 3F 54
+    LD BC,$0006                         ; 5B0A: 01 06 00
+    LD DE,$0040                         ; 5B0D: 11 40 00
+    ADD HL,DE                           ; 5B10: 19
+    LD (HL),$BF                         ; 5B11: 36 BF
+    DEC BC                              ; 5B13: 0B
+    LD A,B                              ; 5B14: 78
+    OR C                                ; 5B15: B1
+    JR NZ,$5B0D                         ; 5B16: 20 F5
+    LD HL,$5BD3                         ; 5B18: 21 D3 5B
+    LD DE,$5471                         ; 5B1B: 11 71 54
+    CALL $5A4D                          ; 5B1E: CD 4D 5A
+    RET                                 ; 5B21: C9
+    LD B,E                              ; 5B22: 43
+    LD C,A                              ; 5B23: 4F
+    LD C,(HL)                           ; 5B24: 4E
+    LD B,A                              ; 5B25: 47
+    LD D,D                              ; 5B26: 52
+    LD B,C                              ; 5B27: 41
+    LD D,H                              ; 5B28: 54
+    LD D,L                              ; 5B29: 55
+    LD C,H                              ; 5B2A: 4C
+    LD B,C                              ; 5B2B: 41
+    LD D,H                              ; 5B2C: 54
+    LD C,C                              ; 5B2D: 49
+    LD C,A                              ; 5B2E: 4F
+    LD C,(HL)                           ; 5B2F: 4E
+    LD D,E                              ; 5B30: 53
+    LD B,B                              ; 5B31: 40
+    LD E,C                              ; 5B32: 59
+    LD C,A                              ; 5B33: 4F
+    LD D,L                              ; 5B34: 55
+    JR NZ,$5B7F                         ; 5B35: 20 48
+    LD B,C                              ; 5B37: 41
+    LD D,(HL)                           ; 5B38: 56
+    LD B,L                              ; 5B39: 45
+    JR NZ,$5B89                         ; 5B3A: 20 4D
+    LD B,C                              ; 5B3C: 41
+    LD B,H                              ; 5B3D: 44
+    LD B,L                              ; 5B3E: 45
+    JR NZ,$5B90                         ; 5B3F: 20 4F
+    LD C,(HL)                           ; 5B41: 4E
+    LD B,L                              ; 5B42: 45
+    JR NZ,$5B94                         ; 5B43: 20 4F
+    LD B,(HL)                           ; 5B45: 46
+    JR NZ,$5B9C                         ; 5B46: 20 54
+    LD C,B                              ; 5B48: 48
+    LD B,L                              ; 5B49: 45
+    JR NZ,$5BA0                         ; 5B4A: 20 54
+    LD C,A                              ; 5B4C: 4F
+    LD D,B                              ; 5B4D: 50
+    LD B,B                              ; 5B4E: 40
+    LD B,(HL)                           ; 5B4F: 46
+    LD C,C                              ; 5B50: 49
+    LD D,(HL)                           ; 5B51: 56
+    LD B,L                              ; 5B52: 45
+    JR NZ,$5BA8                         ; 5B53: 20 53
+    LD B,E                              ; 5B55: 43
+    LD C,A                              ; 5B56: 4F
+    LD D,D                              ; 5B57: 52
+    LD B,L                              ; 5B58: 45
+    LD D,E                              ; 5B59: 53
+    LD L,$40                            ; 5B5A: 2E 40
+    LD C,C                              ; 5B5C: 49
+    LD C,(HL)                           ; 5B5D: 4E
+    LD D,B                              ; 5B5E: 50
+    LD D,L                              ; 5B5F: 55
+    LD D,H                              ; 5B60: 54
+    JR NZ,$5BBC                         ; 5B61: 20 59
+    LD C,A                              ; 5B63: 4F
+    LD D,L                              ; 5B64: 55
+    LD D,D                              ; 5B65: 52
+    JR NZ,$5BB6                         ; 5B66: 20 4E
+    LD B,C                              ; 5B68: 41
+    LD C,L                              ; 5B69: 4D
+    LD B,L                              ; 5B6A: 45
+    LD B,B                              ; 5B6B: 40
+
+; ====================================================================
+; Embedded title-screen string data  ($5B6C-$5BFF)
+; @-terminated ASCII strings used by fn_draw_title_graphics and
+; fn_draw_top_five_box to build the back-buffer.
+; ====================================================================
+
+str_kansas_software:   ; $5B6C
+    ; --- embedded data: title_string_data ---
+    DB       $4B,$41,$4E,$53,$41,$53,$20,$53,$4F,$46,$54,$57,$41,$52,$45,$20 ; ; 5B6C: |KANSAS SOFTWARE |
+    DB       $2A,$2A,$2A,$40,$50,$52,$45,$53,$53,$20,$3C,$49,$3E,$20,$46,$4F ; ; 5B7C: |***@PRESS <I> FO|
+    DB       $52,$20,$49,$4E,$53,$54,$52,$55,$43,$54,$49,$4F,$4E,$53,$20,$4F ; ; 5B8C: |R INSTRUCTIONS O|
+    DB       $52,$20,$3C,$53,$50,$41,$43,$45,$3E,$20,$54,$4F,$20,$53,$54,$41 ; ; 5B9C: |R <SPACE> TO STA|
+    DB       $52,$54,$40,$28,$43,$29,$20,$31,$39,$38,$31,$20,$2D,$20,$4D,$49 ; ; 5BAC: |RT@(C) 1981 - MI|
+    DB       $4B,$45,$20,$43,$48,$41,$4C,$4B,$20,$26,$20,$43,$48,$52,$49,$53 ; ; 5BBC: |KE CHALK & CHRIS|
+    DB       $20,$53,$4D,$59,$54,$48,$40,$2A,$20,$54,$4F,$50,$20,$46,$49,$56 ; ; 5BCC: | SMYTH@* TOP FIV|
+    DB       $45,$20,$2A,$40,$B0,$B0,$B0,$80,$80,$80,$80,$80,$80,$80,$80,$80 ; ; 5BDC: |E *@............|
+    DB       $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$B0,$BE,$85,$80,$8A ; ; 5BEC: |................|
+    DB       $BD,$80,$BC,$B0                                         ; ; 5BFC: |....|
+data_svc_5C00:   ; $5C00
+    ; --- embedded data: svc_data_5C00 ---
+    DB       $B0,$9C,$80,$B8,$8C,$8C,$AC,$80,$B8,$8C,$8C,$B4,$80,$B8,$8C,$8C ; ; 5C00: |................|
+    DB       $BF,$80,$B8,$8C,$8C,$B4,$BF,$83,$83,$83,$BF,$80,$BF,$80,$80,$80 ; ; 5C10: |................|
+    DB       $80,$AF,$B0,$B0,$B8,$80,$AF,$B0,$B0,$BF,$90,$AF,$B0,$B0,$BF,$80 ; ; 5C20: |................|
+    DB       $AF,$B3,$B3,$B3,$BF,$83,$83,$83,$BD,$80,$A0,$B0,$B0,$B0,$90,$80 ; ; 5C30: |................|
+    DB       $A0,$B0,$90,$A0,$B0,$90,$80,$B0,$B0,$B0,$B0,$90,$80,$B0,$B0,$B0 ; ; 5C40: |................|
+    DB       $B0,$B0,$80,$B0,$B0,$B0,$B0,$BF,$8C,$8C,$8C,$B7,$80,$BF,$80,$80 ; ; 5C50: |................|
+    DB       $80,$BF,$80,$BF,$80,$AA,$95,$80,$BF,$80,$BF,$B0,$B0,$B0,$9F,$80 ; ; 5C60: |................|
+    DB       $BF,$B0,$B0,$B0,$80,$80,$BF,$B0,$B0,$BA,$85,$BF,$B0,$B0,$B0,$9F ; ; 5C70: |................|
+    DB       $80,$AF,$B0,$B0,$B0,$9F,$80,$BF,$80,$82,$81,$80,$BF,$80,$BF,$B0 ; ; 5C80: |................|
+    DB       $B0,$B0,$9F,$80,$BF,$B0,$B0,$B0,$B0,$80,$BF,$80,$80,$82,$BD,$BE ; ; 5C90: |................|
+    DB       $83,$83,$83,$83,$80,$A0,$B0,$B0,$B0,$90,$80,$B0,$B0,$B0,$B0,$80 ; ; 5CA0: |................|
+    DB       $80,$80,$B0,$B0,$B0,$80,$80,$A0,$B0,$90,$A0,$B0,$90,$80,$B0,$B0 ; ; 5CB0: |................|
+    DB       $B0,$B0,$90,$80,$B0,$80,$80,$80,$80,$80,$B0,$B0,$B0,$B0,$B0,$8B ; ; 5CC0: |................|
+    DB       $8C,$8C,$8C,$B4,$80,$BF,$80,$80,$80,$83,$80,$BF,$B0,$B0,$BA,$85 ; ; 5CD0: |................|
+    DB       $80,$BE,$85,$80,$8A,$BD,$80,$BF,$80,$AA,$95,$80,$BF,$80,$BF,$B0 ; ; 5CE0: |................|
+    DB       $B0,$B0,$9F,$80,$BF,$80,$80,$80,$80,$80,$BF,$B0,$B0,$B0,$B0,$B0 ; ; 5CF0: |................|
+    DB       $B0,$B0,$9F,$80,$AF,$B0,$B0,$B0,$9C,$80,$BF,$80,$80,$82,$BD,$80 ; ; 5D00: |................|
+    DB       $BF,$83,$83,$83,$BF,$80,$BF,$80,$82,$81,$80,$BF,$80,$BF,$B0,$B0 ; ; 5D10: |................|
+    DB       $B0,$9F,$80,$BF,$B0,$B0,$B0,$B0,$80,$BF,$B0,$B0,$B0,$B0 ; ; 5D20: |..............|
+
+; ====================================================================
+; fn_svc_misc2_impl  ($5D2E)
+; SVC_MISC2 implementation.  Called as: CALL $580C
+; Clears back-buffer then copies 5 @-terminated control strings + one
+; raw block (552 bytes from $5E7F) into specific back-buffer positions.
+; Used to build the "controls" help screen in the back-buffer.
+; ====================================================================
+
+fn_svc_misc2_impl:   ; $5D2E
+    CALL $5803                          ; 5D2E: CD 03 58
+    LD HL,$5D73                         ; 5D31: 21 73 5D
+    LD DE,$5407                         ; 5D34: 11 07 54
+    CALL $5D6A                          ; 5D37: CD 6A 5D
+    LD HL,$5DA7                         ; 5D3A: 21 A7 5D
+    LD DE,$5447                         ; 5D3D: 11 47 54
+    CALL $5D6A                          ; 5D40: CD 6A 5D
+    LD HL,$5DDB                         ; 5D43: 21 DB 5D
+    LD DE,$5487                         ; 5D46: 11 87 54
+    CALL $5D6A                          ; 5D49: CD 6A 5D
+    LD HL,$5E11                         ; 5D4C: 21 11 5E
+    LD DE,$54C7                         ; 5D4F: 11 C7 54
+    CALL $5D6A                          ; 5D52: CD 6A 5D
+    LD HL,$5E47                         ; 5D55: 21 47 5E
+    LD DE,$57C4                         ; 5D58: 11 C4 57
+    CALL $5D6A                          ; 5D5B: CD 6A 5D
+    LD HL,$5E7F                         ; 5D5E: 21 7F 5E
+    LD DE,$5580                         ; 5D61: 11 80 55
+    LD BC,$0228                         ; 5D64: 01 28 02
+    LDIR                                ; 5D67: ED B0
+    RET                                 ; 5D69: C9
+
+; fn_copy_until_at_2  ($5D6A)  -- local copy-until-@ (same logic as $5A4D)
+
+fn_copy_until_at_2:   ; $5D6A
+    LD A,(HL)                           ; 5D6A: 7E
+    CP $40                              ; 5D6B: FE 40
+    RET Z                               ; 5D6D: C8
+    LD (DE),A                           ; 5D6E: 12
+    INC DE                              ; 5D6F: 13
+    INC HL                              ; 5D70: 23
+    JR $5D6A                            ; 5D71: 18 F7
+
+; ====================================================================
+; fn_svc_misc2 embedded string data  ($5D73-$5DFF)
+; @-terminated ASCII strings describing game controls.
+; Copied into the splash back-buffer by fn_svc_misc2_impl above.
+; ====================================================================
+
+str_misc2_controls_1:   ; $5D73
+    ; --- embedded data: svc_misc2_string_data ---
+    DB       $54,$4F,$20,$4D,$4F,$56,$45,$20,$42,$4F,$4D,$42,$45,$52,$20,$20 ; ; 5D73: |TO MOVE BOMBER  |
+    DB       $4C,$45,$46,$54,$2C,$52,$49,$47,$48,$54,$20,$20,$50,$52,$45,$53 ; ; 5D83: |LEFT,RIGHT  PRES|
+    DB       $53,$20,$41,$52,$52,$4F,$57,$20,$4B,$45,$59,$53,$20,$4F,$52,$20 ; ; 5D93: |S ARROW KEYS OR |
+    DB       $4F,$2C,$50,$40,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20 ; ; 5DA3: |O,P@            |
+    DB       $20,$20,$20,$20,$20,$20,$55,$50,$2C,$44,$4F,$57,$4E,$20,$20,$20 ; ; 5DB3: |      UP,DOWN   |
+    DB       $50,$52,$45,$53,$53,$20,$41,$52,$52,$4F,$57,$20,$4B,$45,$59,$53 ; ; 5DC3: |PRESS ARROW KEYS|
+    DB       $20,$4F,$52,$20,$51,$2C,$57,$40,$54,$4F,$20,$46,$49,$52,$45,$20 ; ; 5DD3: | OR Q,W@TO FIRE |
+    DB       $4D,$41,$43,$48,$49,$4E,$45,$20,$47,$55,$4E,$20,$50,$52,$45,$53 ; ; 5DE3: |MACHINE GUN PRES|
+    DB       $53,$20,$4C,$45,$46,$54,$20,$26,$20,$52,$49,$47,$48     ; ; 5DF3: |S LEFT & RIGH|
+
 
 ; ====================================================================
 ; INSTRUCTIONS SCREEN DATA  ($5E00-$60AF)
@@ -282,7 +957,7 @@ fn_title_redraw:   ; $60E1
     JR NZ,.title_loop  ; still animating → keep polling    ; 6104: 20 ED
 
 .any_key_wait:   ; $6106
-    CALL $5803   ; SVC_KEYBOARD → wait for any keypress    ; 6106: CD 03 58
+    CALL $5803   ; SVC_CLR_BUF → clear back-buffer ($5400-$57FF)  ; 6106: CD 03 58
     CALL $5800   ; SVC_DISPLAY → refresh display           ; 6109: CD 00 58
     JP .instr_show  ; → show instructions                  ; 610C: C3 35 61
 
@@ -303,7 +978,7 @@ fn_title_redraw:   ; $60E1
 .space_pressed:   ; $6126  ← player pressed SPACE = start game
     CALL $643C   ; fn_clear_buffers                        ; 6126: CD 3C 64
     CALL $638F   ; fn_init_game_state (fresh game: score=0, lives=3) ; 6129: CD 8F 63
-    CALL $5803   ; SVC_KEYBOARD (flush key buffer)         ; 612C: CD 03 58
+    CALL $5803   ; SVC_CLR_BUF → clear back-buffer             ; 612C: CD 03 58
     CALL $5800   ; SVC_DISPLAY                             ; 612F: CD 00 58
     JP fn_main_game_loop  ; → main gameplay loop           ; 6132: C3 AD 61
 
@@ -583,7 +1258,7 @@ fn_init_level:   ; $6247
     INC DE                                                            ; 62F0: 13
     DJNZ .L62ED   ; copy all 6 score bytes                            ; 62F1: 10 FA
     PUSH HL       ; save pointer (now points to name field)           ; 62F3: E5
-    CALL $5806    ; SVC_KEYBOARD2: wait/read player initials input     ; 62F4: CD 06 58
+    CALL $5806    ; SVC_DRAW_TITLE_FRAME: clear + border + title text   ; 62F4: CD 06 58
     LD HL,$669C   ; HL → initials buffer ("SCORE" at $669C = player name) ; 62F7: 21 9C 66
     LD DE,$549A   ; DE → back-buffer position for score display        ; 62FA: 11 9A 54
     LD BC,$000C   ; 12 bytes to copy                                  ; 62FD: 01 0C 00
@@ -2177,8 +2852,13 @@ level_pos:   ; $6AB0  — terrain-type byte at the ship's current column
 scroll_sub:   ; $6AB1  — sub-pixel scroll accumulator (used by fn_draw_fuel_bar)
     DB $30       ; initial = $30
 
-ship_vram_off:   ; $6AB2  — 16-bit VRAM offset for ship sprite position
-    DW $73CC     ; initial = $73CC (overwritten at runtime)
+ship_vram_off:   ; $6AB2  — base address of the game display back-buffer ($73CC).
+                 ;   Used by fn_copy_screen_row ($6F23) as the LDIR source for
+                 ;   blitting the game screen to VRAM.  Also used as the VRAM
+                 ;   base offset for ship-sprite position calculations.
+                 ;   Initial CMD value = $73CC (start of 2KB game back-buffer).
+                 ;   Updated at runtime as the terrain scrolls.
+    DW $73CC     ; initial = $73CC (game back-buffer base)
 
     DB $CC $77   ; $6AB4–$6AB5: reserved bytes
 
@@ -3179,16 +3859,30 @@ fn_set_pixel_bit:   ; $6F13
     LD ($6F21),A    ; ** SELF-MODIFYING ** patch SET operand byte   ; 6F1D: 32 21 6F
     RLC B           ; execute: CB ?? = SET n,(HL) (patched byte)   ; 6F20: CB 00
     RET             ; return                                       ; 6F22: C9
-; fn_copy_title_screen_to_vram:
-;   Copies the 1024-byte ($0400) pre-formed title screen image from the address
-;   stored in $6AB2 (= $5E00 at startup) directly into video RAM at $3C00.
-;   This is the mechanism by which the title/attract screen is displayed:
-;   the entire 64×16 semigraphic VRAM layout is stored as a flat binary blob
-;   at $5E00-$61FF and blasted to VRAM in one LDIR instruction.
-    LD BC,$0400                                             ; 6F23: 01 00 04  ; 1024 bytes = full screen
-    LD HL,($6AB2)                                           ; 6F26: 2A B2 6A  ; src = title screen data ($5E00)
+; fn_copy_screen_row  ($6F23)  [also called fn_blit_display_page]
+;   Blits 1024 bytes ($0400) from the game display back-buffer to live VRAM.
+;   The source address is the value stored at ship_vram_off ($6AB2).
+;
+;   $6AB2 = ship_vram_off — the game display buffer base address.
+;   Its initial value in the CMD file is $73CC (the start of the 2KB
+;   game back-buffer at $73CC-$7BCB).  It is NOT $5E00.
+;
+;   This function is the general-purpose screen blit, called every frame:
+;     - From fn_instr_scroll_loop ($616E): during the instructions scroll
+;       animation (fn_scroll_screen renders $5E00 text into the back-buffer,
+;       then this function pushes the result to VRAM).
+;     - From fn_main_game_loop ($61D0, $61FC): during normal gameplay to
+;       flush each rendered frame from $73CC to the live display.
+;
+;   NOTE: There is NO pre-formed 1KB flat screen image stored in the CMD.
+;   The splash screen is built dynamically into $5400-$57FF by
+;   fn_draw_title_graphics ($5A56) and blitted by LDIR at $60D7.
+;   The instructions screen is rendered progressively by fn_scroll_screen
+;   ($64CA) from the 688-byte source data at $5E00-$60AF.
+    LD BC,$0400                                             ; 6F23: 01 00 04  ; 1024 bytes = full VRAM page
+    LD HL,($6AB2)                                           ; 6F26: 2A B2 6A  ; src = ship_vram_off = game back-buffer ($73CC)
     LD DE,$3C00                                             ; 6F29: 11 00 3C  ; dst = video RAM base
-    LDIR                                                    ; 6F2C: ED B0     ; copy all 1024 bytes
+    LDIR                                                    ; 6F2C: ED B0     ; blit 1KB from back-buffer → live VRAM
     RET                                                     ; 6F2E: C9
     LD BC,$03FF                                             ; 6F2F: 01 FF 03
     LD HL,($6AB2)                                           ; 6F32: 2A B2 6A
